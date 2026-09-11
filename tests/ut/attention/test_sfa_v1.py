@@ -29,7 +29,7 @@ from vllm_ascend.attention.sfa_v1 import (
     custom_kv_rmsnorm_rope,
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
-from vllm_ascend.device.device_op import BaseDeviceAdaptor, DeviceOperator
+from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor, DeviceOperator
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
     AscendW8A8LinearMethod,
@@ -1149,3 +1149,54 @@ class TestAscendSFAImpl(TestBase):
         self.assertIs(impl._quant_type, AscendW8A8MXFP8DynamicLinearMethod)
 
     # (MLAPO runtime path requires NPU hardware; covered by integration tests.)
+
+
+class TestA5GlmIndexerV2Dispatch(TestBase):
+    def test_glm_uses_v2_with_both_main_cache_layouts(self):
+        for packed_main in (False, True):
+            main_count = 1 if packed_main else 2
+            key = torch.empty(2, 128, 1, 128, dtype=torch.float8_e4m3fn)
+            key_scale = torch.empty(2, 128, 1, 1, dtype=torch.float32)
+            cache = (*(torch.empty(1) for _ in range(main_count)), key, key_scale)
+            impl = SimpleNamespace(
+                enable_sparse_sfa_c8=packed_main,
+                kv_cache_indexer_k_idx=main_count,
+                kv_cache_indexer_scale_idx=main_count + 1,
+            )
+            metadata = SimpleNamespace(qli_v2=object(), block_table=torch.zeros(1, 1, dtype=torch.int32))
+            with patch("vllm_ascend.device.device_op.select_sfa_topk") as select:
+                result = A5DeviceAdaptor.indexer_select_post_process(
+                    impl,
+                    torch.empty(64, 128, dtype=torch.float8_e4m3fn),
+                    torch.ones(64),
+                    (1, 64, 128),
+                    torch.ones(1, 64, dtype=torch.bfloat16),
+                    cache,
+                    metadata,
+                    torch.tensor([1], dtype=torch.int32),
+                    torch.tensor([128], dtype=torch.int32),
+                    True,
+                    True,
+                )
+                self.assertIs(result, select.return_value)
+                self.assertIs(select.call_args.kwargs["key"], key)
+                self.assertEqual(select.call_args.kwargs["key_scale"].shape, (2, 128, 1))
+                self.assertEqual(select.call_args.kwargs["query"].shape, (1, 64, 128))
+                self.assertIs(select.call_args.kwargs["metadata"], metadata.qli_v2)
+
+    def test_missing_glm_metadata_fails_instead_of_using_legacy(self):
+        impl = SimpleNamespace(enable_sparse_sfa_c8=False, kv_cache_indexer_k_idx=2, kv_cache_indexer_scale_idx=3)
+        with self.assertRaisesRegex(RuntimeError, "requires QLI V2 metadata"):
+            A5DeviceAdaptor.indexer_select_post_process(
+                impl,
+                torch.empty(64, 128, dtype=torch.float8_e4m3fn),
+                torch.ones(64),
+                (1, 64, 128),
+                torch.ones(1, 64, dtype=torch.bfloat16),
+                (torch.empty(1), torch.empty(1), torch.empty(2, 128, 1, 128), torch.empty(2, 128, 1, 1)),
+                SimpleNamespace(qli_v2=None),
+                torch.tensor([1], dtype=torch.int32),
+                torch.tensor([128], dtype=torch.int32),
+                True,
+                True,
+            )

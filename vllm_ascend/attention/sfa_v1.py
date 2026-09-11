@@ -22,6 +22,13 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_indexer import (
+    QLI_V2_FP8_PER_TOKEN,
+    QLI_V2_MXFP4,
+    SFAIndexerMetadata,
+    SFAIndexerMetadataBuilder,
+    quantize_sfa_indexer_mxfp4,
+)
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
     SFA_QSFA_TILE_SIZE,
@@ -58,6 +65,9 @@ from vllm_ascend.utils import (
     enable_sp,
     maybe_trans_nz,
 )
+
+if HAS_TRITON:
+    import vllm_ascend.ops.triton.sfa_indexer_cache  # noqa: F401
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -180,6 +190,7 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
+    qli_v2: SFAIndexerMetadata | None = None
     # Request identity for the Sparse KV offload resident LRU; only populated
     # by AscendSFAKVOffloadMetadataBuilder.
     req_ids_tensor: torch.Tensor | None = None
@@ -239,6 +250,22 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
         self.reorder_batch_threshold = self.decode_threshold
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self.qli_v2_builder: SFAIndexerMetadataBuilder | None = None
+        hf_config = self.model_config.hf_config
+        if (
+            hf_config.model_type == "glm_moe_dsa"
+            and get_ascend_config().enable_sparse_li_c8
+            and get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+        ):
+            self.qli_v2_builder = SFAIndexerMetadataBuilder(
+                hf_config.index_n_heads,
+                hf_config.index_head_dim,
+                vllm_config.scheduler_config.max_num_seqs * self.decode_threshold,
+                self.device,
+                quant_mode=(
+                    QLI_V2_MXFP4 if get_ascend_config().sfa_indexer_quant_mode == "mxfp4" else QLI_V2_FP8_PER_TOKEN
+                ),
+            )
 
     def _prepare_parallel_metadata(
         self,
@@ -367,6 +394,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 block_size,
             )
 
+        qli_v2 = None
+        if self.qli_v2_builder is not None:
+            # DSA-CP uses rank-local cumulative Q ends and effective causal K
+            # lengths. Build the schedule from the same view as the consumer.
+            cp_context = parallel_metadata.get("dsa_cp_context")
+            qli_v2 = self.qli_v2_builder.build(
+                cp_context.actual_seq_lengths_query if cp_context is not None else cum_query_lens,
+                cp_context.actual_seq_lengths_key if cp_context is not None else seq_lens,
+                draft_index,
+            )
+
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
@@ -385,6 +423,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=common_attn_metadata.group_len,
             group_key_idx=common_attn_metadata.group_key_idx,
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
+            qli_v2=qli_v2,
             **parallel_metadata,
         )
 
@@ -509,6 +548,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # - C8 indexer cache for lightning indexer.
         # The user-facing switches control these layouts independently. LI C8
         # applies only to layers that own an indexer cache.
+        self.indexer_quant_mode = ascend_config.sfa_indexer_quant_mode
         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
         self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.indexer.k_cache.prefix)
         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
@@ -1152,9 +1192,16 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if self.enable_sparse_li_c8:
             k_li = k_li @ AscendSFAImpl.k_hadamard
-            k_li, k_li_scale = torch_npu.npu_dynamic_quant(k_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
-            k_li_scale = k_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
-            k_li_scale = k_li_scale.unsqueeze(-1)  # [b*s,1]
+            if self.indexer_quant_mode == "mxfp4":
+                k_li, k_li_scale = quantize_sfa_indexer_mxfp4(k_li, torch_npu)
+                k_li = k_li.flatten(1)
+                k_li_scale = k_li_scale.flatten(1)
+            else:
+                k_li, k_li_scale = torch_npu.npu_dynamic_quant(
+                    k_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype
+                )
+                k_li_scale = k_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+                k_li_scale = k_li_scale.unsqueeze(-1)  # [b*s,1]
         else:
             k_li_scale = None
 
@@ -1227,8 +1274,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.enable_sparse_li_c8:
             q_li_shape_ori = q_li.shape
             q_li = q_li @ AscendSFAImpl.q_hadamard
-            q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
-            q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+            if self.indexer_quant_mode == "mxfp4":
+                q_li, q_li_scale = quantize_sfa_indexer_mxfp4(q_li, torch_npu)
+            else:
+                q_li, q_li_scale = torch_npu.npu_dynamic_quant(
+                    q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype
+                )
+                q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
         return DeviceOperator.indexer_select_post_process(
             self,
@@ -1464,6 +1516,17 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> None:
         dsa_k_cache_idx = self.kv_cache_indexer_k_idx
         dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
+
+        if self.enable_sparse_li_c8 and self.indexer_quant_mode == "mxfp4":
+            assert k_li_scale is not None
+            torch.ops.vllm.sfa_indexer_mxfp4_cache(
+                k_li,
+                k_li_scale,
+                kv_cache[dsa_k_cache_idx],
+                kv_cache[dsa_k_scale_cache_idx],
+                slot_mapping.view(-1),
+            )
+            return
 
         use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
         if use_li_c8_reshape_optim:

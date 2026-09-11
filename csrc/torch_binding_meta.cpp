@@ -1,3 +1,4 @@
+#include "attention/quant_lightning_indexer_v2/qli_v2_mxfp4_validation.h"
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/version.h>
@@ -948,6 +949,9 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_meta(
     int64_t max_seqlen_q, c10::string_view layout_q, c10::string_view layout_k,
     int64_t mask_mode, int64_t cmp_ratio, int64_t return_value)
 {
+    if (quant_mode == 5) {
+        vllm_ascend::CheckQLIV2MxFp4Inputs(query, key, weights, query_dequant_scale, key_dequant_scale, layout_q, layout_k);
+    }
     std::string query_layout_str = std::string(layout_q);
     std::string key_layout_str = std::string(layout_k);
     std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer_output = construct_quant_lightning_indexer_v2_output_tensor(

@@ -136,19 +136,25 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 kv_cache_spec[layer_name] = spec
                 continue
             cache_sparse_li_c8 = get_ascend_config().is_sparse_li_c8_layer(layer_name)
+            indexer_mxfp4 = cache_sparse_li_c8 and get_ascend_config().sfa_indexer_quant_mode == "mxfp4"
             kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
                 block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=1,
                 head_size=vllm_config.model_config.hf_text_config.index_head_dim,
-                dtype=c8_k_cache_dtype
+                dtype=torch.uint8
+                if indexer_mxfp4
+                else c8_k_cache_dtype
                 if cache_sparse_li_c8
                 else get_kv_cache_torch_dtype(
                     vllm_config.cache_config.cache_dtype,
                     vllm_config.model_config.dtype,
                 ),
                 cache_dtype_str=vllm_config.cache_config.cache_dtype,
-                scale_dim=1 if cache_sparse_li_c8 else 0,
-                scale_dtype=c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8,
+                scale_dim=4 if indexer_mxfp4 else (1 if cache_sparse_li_c8 else 0),
+                scale_dtype=torch.uint8
+                if indexer_mxfp4
+                else (c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8),
+                indexer_quant_mode="mxfp4" if indexer_mxfp4 else "fp8",
                 cache_sparse_li_c8=cache_sparse_li_c8,
                 sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size,
             )
@@ -732,7 +738,7 @@ def _allocate_kv_cache(
                 * example_spec.sfa_dcp_replicated_indexer_size
                 * example_spec.block_size
                 * example_spec.num_kv_heads
-                * example_spec.head_size
+                * example_spec.storage_head_size
                 * get_dtype_size(example_spec.dtype)
             )
             if example_spec.scale_dim:
@@ -942,7 +948,7 @@ def _reshape_kv_cache_v2(
                     num_blocks * group_spec.sfa_dcp_replicated_indexer_size,
                     group_spec.block_size,
                     group_spec.num_kv_heads,
-                    group_spec.head_size,
+                    group_spec.storage_head_size,
                 )
 
                 indexer_k_cache = raw_k_tensor.view(group_spec.dtype).view(kv_cache_shape)

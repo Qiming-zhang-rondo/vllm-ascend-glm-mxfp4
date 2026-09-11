@@ -120,8 +120,23 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
     scale_dim: int = 0
     scale_dtype: torch.dtype = torch.int8
     cache_sparse_li_c8: bool = False
+    indexer_quant_mode: str = "fp8"
     cache_dtype_str: str | None = None
     sfa_dcp_replicated_indexer_size: int = 1
+
+    @property
+    def storage_head_size(self) -> int:
+        """Physical elements per K row; head_size remains the logical dimension."""
+        if self.indexer_quant_mode == "mxfp4":
+            if (
+                self.head_size != 128
+                or self.dtype != torch.uint8
+                or self.scale_dim != 4
+                or self.scale_dtype != torch.uint8
+            ):
+                raise ValueError("MXFP4 indexer cache requires D128, packed uint8 K and four E8M0 bytes per row.")
+            return self.head_size // 2
+        return self.head_size
 
     @property
     def page_size_bytes(self) -> int:
@@ -133,7 +148,7 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
         return (
             self.sfa_dcp_replicated_indexer_size
             * num_heads_per_page
-            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+            * (self.storage_head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
         )
 
     @classmethod
@@ -146,6 +161,8 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
         scale_dim_set = set(spec.scale_dim for spec in specs)
         scale_dtype_set = set(spec.scale_dtype for spec in specs)
         cache_sparse_li_c8_set = set(spec.cache_sparse_li_c8 for spec in specs)
+        indexer_quant_modes = {spec.indexer_quant_mode for spec in specs}
+        head_sizes = {spec.head_size for spec in specs}
         sfa_dcp_replicated_indexer_size_set = set(spec.sfa_dcp_replicated_indexer_size for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
@@ -153,6 +170,8 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
             and len(scale_dim_set) == 1
             and len(scale_dtype_set) == 1
             and len(cache_sparse_li_c8_set) == 1
+            and len(indexer_quant_modes) == 1
+            and len(head_sizes) == 1
             and len(sfa_dcp_replicated_indexer_size_set) == 1
         ), (
             "All SFA indexer cache layers in the same KV cache group must use "
@@ -168,6 +187,7 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
             scale_dim=scale_dim_set.pop(),
             scale_dtype=scale_dtype_set.pop(),
             cache_sparse_li_c8=cache_sparse_li_c8_set.pop(),
+            indexer_quant_mode=indexer_quant_modes.pop(),
             sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
         )
 

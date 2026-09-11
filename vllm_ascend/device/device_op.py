@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.attention.sfa_indexer import select_sfa_topk
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
 from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
@@ -1306,8 +1307,33 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             assert q_li_shape_ori is not None
 
             if q_li_scale is not None:
+                if getattr(sfa_impl, "indexer_quant_mode", "fp8") == "mxfp4":
+                    if attn_metadata.qli_v2 is None or attn_metadata.qli_v2.quant_mode != 5:
+                        raise RuntimeError("MXFP4 indexer requires matching QLI V2 mode-5 metadata.")
+                    return select_sfa_topk(
+                        query=q_li,
+                        key=kv_cache[indexer_cache_idx],
+                        weights=weights,
+                        query_scale=q_li_scale,
+                        key_scale=kv_cache[indexer_scale_cache_idx],
+                        block_table=attn_metadata.block_table,
+                        metadata=attn_metadata.qli_v2,
+                    )
                 q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
                 key_dequant_scale = kv_cache[indexer_scale_cache_idx].squeeze(2)
+
+                if use_torch_npu_lightning_indexer:
+                    if attn_metadata.qli_v2 is None:
+                        raise RuntimeError("A5 GLM FP8 indexer requires QLI V2 metadata from the SFA builder.")
+                    return select_sfa_topk(
+                        query=q_li.view(q_li_shape_ori),
+                        key=kv_cache[indexer_cache_idx],
+                        weights=weights,
+                        query_scale=q_li_scale,
+                        key_scale=key_dequant_scale,
+                        block_table=attn_metadata.block_table,
+                        metadata=attn_metadata.qli_v2,
+                    )
 
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=q_li.view(q_li_shape_ori),

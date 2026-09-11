@@ -29,6 +29,8 @@
 #include "ops.h"
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
+#include "attention/quant_lightning_indexer_v2/qli_v2_mxfp4_validation.h"
+#include "attention/quant_lightning_indexer_v2/qli_v2_torch_adapter.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "moe/rms_norm_cast/rms_norm_cast_torch_adpt.h"
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
@@ -1150,6 +1152,19 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_npu(
         auto contiguous_axes_result_key_scale = is_contiguous_axes(key_dequant_scale);
         TORCH_CHECK(contiguous_axes_result_key_scale[1] && contiguous_axes_result_key_scale[2],
                     "key_dequant_scale must be contiguous on all axes except axis 0");
+    }
+
+    if (quant_mode == 5) {
+        CheckQLIV2MxFp4Inputs(query, key, weights, query_dequant_scale, key_dequant_scale, layout_q, layout_k);
+        QLIV2TensorWrapper q{query, ACL_FLOAT4_E2M1};
+        QLIV2TensorWrapper k{key, ACL_FLOAT4_E2M1};
+        QLIV2TensorWrapper qs{query_dequant_scale, ACL_FLOAT8_E8M0};
+        QLIV2TensorWrapper ks{key_dequant_scale, ACL_FLOAT8_E8M0};
+        EXEC_NPU_CMD(aclnnQuantLightningIndexerV2, q, k, weights, qs, ks,
+            cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k, block_table, output_idx_offset, metadata,
+            topk, quant_mode, max_seqlen_q, query_layout_ptr, key_layout_ptr, mask_mode, cmp_ratio, return_value,
+            sparse_indices_out, sparse_values_out);
+        return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
     }
 
     EXEC_NPU_CMD(aclnnQuantLightningIndexerV2, query, key, weights, query_dequant_scale, key_dequant_scale,

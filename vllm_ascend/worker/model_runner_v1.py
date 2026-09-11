@@ -4556,7 +4556,7 @@ class NPUModelRunner(GPUModelRunner):
                         * current_kv_cache_spec.sfa_dcp_replicated_indexer_size
                         * current_kv_cache_spec.block_size
                         * current_kv_cache_spec.num_kv_heads
-                        * current_kv_cache_spec.head_size
+                        * current_kv_cache_spec.storage_head_size
                         * get_dtype_size(current_kv_cache_spec.dtype)
                     )
                     if current_kv_cache_spec.scale_dim:
@@ -4803,7 +4803,7 @@ class NPUModelRunner(GPUModelRunner):
                         num_blocks * current_kv_cache_spec.sfa_dcp_replicated_indexer_size,
                         current_kv_cache_spec.block_size,
                         current_kv_cache_spec.num_kv_heads,
-                        current_kv_cache_spec.head_size,
+                        current_kv_cache_spec.storage_head_size,
                     )
                     indexer_k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(kv_cache_shape)
                     if raw_scale_tensor is None:
@@ -5451,14 +5451,24 @@ class NPUModelRunner(GPUModelRunner):
                 # Remove this special case once the generic vLLM spec/backend
                 # path can describe the Ascend SFA indexer layout directly.
                 cache_sparse_li_c8 = self.ascend_config.is_sparse_li_c8_layer(layer_name)
+                indexer_mxfp4 = cache_sparse_li_c8 and self.ascend_config.sfa_indexer_quant_mode == "mxfp4"
                 kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
                     block_size=self.block_size,
                     num_kv_heads=1,
                     head_size=self.model_config.hf_text_config.index_head_dim,
-                    dtype=self.c8_k_cache_dtype if cache_sparse_li_c8 else self.kv_cache_dtype,
+                    dtype=(
+                        torch.uint8
+                        if indexer_mxfp4
+                        else (self.c8_k_cache_dtype if cache_sparse_li_c8 else self.kv_cache_dtype)
+                    ),
                     cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                    scale_dim=1 if cache_sparse_li_c8 else 0,
-                    scale_dtype=self.c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8,
+                    scale_dim=4 if indexer_mxfp4 else (1 if cache_sparse_li_c8 else 0),
+                    scale_dtype=(
+                        torch.uint8
+                        if indexer_mxfp4
+                        else (self.c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8)
+                    ),
+                    indexer_quant_mode="mxfp4" if indexer_mxfp4 else "fp8",
                     cache_sparse_li_c8=cache_sparse_li_c8,
                     sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
                 )

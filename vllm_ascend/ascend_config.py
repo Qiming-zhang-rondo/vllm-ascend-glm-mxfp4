@@ -272,6 +272,7 @@ class AscendConfig:
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
+            "sfa_indexer_quant_mode": "fp8",
             "ascend_compilation_config": {
                 "enable_npugraph_ex": true,
                 "enable_static_kernel": false,
@@ -398,6 +399,9 @@ class AscendConfig:
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
     # model's quant_type, 0 means disabled (use the model's own quant).
     combine_quant_mode: Literal[0, 2, 3, 4] = 0
+    # GLM SFA indexer Q/K and cache quantization; independent of linear weights.
+    # MXFP4 requires A5, LI C8 enabled, logical head_dim=128 and Triton scatter.
+    sfa_indexer_quant_mode: Literal["fp8", "mxfp4"] = "fp8"
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
     # Per-rank token capacity after dispatch in the fused MC2/MegaMoe path.
     # The same value is passed as dispatch_ffn_combine's max_output_size
@@ -692,7 +696,29 @@ class AscendConfig:
 
         # sparse KV offload vs sparse SFA C8 main cache mutex
         self._validate_sparse_c8_kv_offload_compatibility()
+        self._validate_sfa_indexer_quantization(vllm_config)
         return self
+
+    def _validate_sfa_indexer_quantization(self, vllm_config: VllmConfig) -> None:
+        from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+
+        hardware_profile = get_current_hardware_profile()
+        if self.sfa_indexer_quant_mode == "mxfp4":
+            from vllm.triton_utils import HAS_TRITON
+
+            if not hardware_profile.supports(HardwareCapability.FP8_ATTENTION):
+                raise ValueError("sfa_indexer_quant_mode=mxfp4 requires Ascend A5.")
+            if vllm_config.model_config.hf_config.model_type != "glm_moe_dsa":
+                raise ValueError("MXFP4 SFA indexer requires the glm_moe_dsa SFA model path.")
+            if not self.enable_sparse_li_c8:
+                raise ValueError("sfa_indexer_quant_mode=mxfp4 requires enable_sparse_li_c8=true.")
+            if vllm_config.model_config.hf_text_config.index_head_dim != 128:
+                raise ValueError("MXFP4 SFA indexer requires logical index_head_dim=128.")
+            if not HAS_TRITON:
+                raise ValueError("MXFP4 SFA cache writes require triton-ascend.")
+            # StoreKVBlock only supports its original C8/scale contract.
+            # Packed FP4 uses the byte-scatter kernel, including on P nodes.
+            self._c8_reshape_optim_enabled = False
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
         from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
