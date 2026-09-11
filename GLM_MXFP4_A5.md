@@ -5,6 +5,30 @@ This branch is based on vLLM-Ascend `main` at
 consumer to `QuantLightningIndexerV2` and adds the A5 MXFP4 Q/K and cache
 producer contract.
 
+First run the standalone QLI V2 MXFP4 compute-op bring-up. It needs no model
+weights and does not depend on `pytest`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Qiming-zhang-rondo/vllm-ascend-glm-mxfp4/main/tools/test_qli_v2_mxfp4_a5.sh | bash
+```
+
+This invokes the required Metadata op and then executes only
+`QuantLightningIndexerV2` with `quant_mode=5`. It covers both dense and
+axis-0-strided PA caches and validates the packed E2M1 payload, E8M0 scales,
+causal output counts, bounds, and uniqueness. It also checks Top-2048 recall
+and score error against an FP32 reference, then reports synchronized P50/P90
+compute latency for MXFP4 mode 5 and FP8 mode 1 on the same shape. The default
+shape is one decode query, 64 index heads, D128, and an 8192-token K sequence.
+
+The accuracy thresholds and benchmark size can be overridden without editing
+the script: `QLI_MIN_TOPK_RECALL`, `QLI_MIN_SCORE_COSINE`,
+`QLI_MAX_SCORE_NMAE`, `QLI_KEY_TOKENS`, `QLI_QUERY_TOKENS`, `QLI_WARMUP`, and
+`QLI_ITERS`. Set `QLI_MAX_MXFP4_P50_MS` only when the target machine has an
+agreed absolute latency gate.
+
+After the standalone operator passes, install the branch and run the broader
+focused tests:
+
 Run this inside the existing A5 vLLM-Ascend container:
 
 ```bash
