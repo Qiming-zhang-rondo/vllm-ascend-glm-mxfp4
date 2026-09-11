@@ -30,5 +30,5 @@ disabled.
 If the container uses another Ascend 950 target string, override it explicitly:
 
 ```bash
-SOC_VERSION=<actual-ascend-950-soc> curl -fsSL https://raw.githubusercontent.com/Qiming-zhang-rondo/vllm-ascend-glm-mxfp4/main/tools/install_glm_mxfp4_a5.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Qiming-zhang-rondo/vllm-ascend-glm-mxfp4/main/tools/install_glm_mxfp4_a5.sh | env SOC_VERSION=<actual-ascend-950-soc> bash
 ```
