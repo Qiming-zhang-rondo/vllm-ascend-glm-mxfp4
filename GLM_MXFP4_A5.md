@@ -5,26 +5,31 @@ This branch is based on vLLM-Ascend `main` at
 consumer to `QuantLightningIndexerV2` and adds the A5 MXFP4 Q/K and cache
 producer contract.
 
-First run the standalone QLI V2 MXFP4 compute-op bring-up. It needs no model
-weights and does not depend on `pytest`:
+First run the standalone QLI V2 MXFP4 compute-op test in the **existing A5
+container**. It reuses its Python, torch, torch_npu and CANN, requires no model
+weights, and does not install VA or download build dependencies:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Qiming-zhang-rondo/vllm-ascend-glm-mxfp4/main/tools/test_qli_v2_mxfp4_a5.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Qiming-zhang-rondo/vllm-ascend-glm-mxfp4/main/tools/test_qli_v2_mxfp4_a5.sh -o test_qli.sh && bash test_qli.sh --update
 ```
 
-This invokes the required Metadata op and then executes only
-`QuantLightningIndexerV2` with `quant_mode=5`. It covers both dense and
-axis-0-strided PA caches and validates the packed E2M1 payload, E8M0 scales,
-causal output counts, bounds, and uniqueness. It also checks Top-2048 recall
-and score error against an FP32 reference, then reports synchronized P50/P90
-compute latency for MXFP4 mode 5 and FP8 mode 1 on the same shape. The default
-shape is one decode query, 64 index heads, D128, and an 8192-token K sequence.
+The test executes a real mode-5 C4 compute probe; Metadata/API presence alone
+is insufficient. If necessary it selectively builds the bundled QLI V2 and
+Metadata operators using existing CANN development dependencies, or reports
+exactly which local prerequisites are missing. Matching private builds are
+reused. It does not replace the system CANN or rebuild the VA package.
 
-The accuracy thresholds and benchmark size can be overridden without editing
-the script: `QLI_MIN_TOPK_RECALL`, `QLI_MIN_SCORE_COSINE`,
-`QLI_MAX_SCORE_NMAE`, `QLI_KEY_TOKENS`, `QLI_QUERY_TOKENS`, `QLI_WARMUP`, and
-`QLI_ITERS`. Set `QLI_MAX_MXFP4_P50_MS` only when the target machine has an
-agreed absolute latency gate.
+It validates C4 and FP8 accuracy against decoded-payload and original-input
+references, checks strided cache addressing, and reports synchronous wall
+P50/P90 latency. This includes ACLNN preparation and synchronization, not just
+kernel execution. Logs and a JSON report are saved automatically.
+
+See [the container test guide](QLI_SINGLE_OP_A5.md) for options, operator
+capability checks, fixed startup/dependency bugs, and verification limits.
+CANN compilation and A5 execution have not been validated locally.
+
+The model installation below is a separate deployment workflow and is **not
+invoked by the single-operator test**.
 
 After the standalone operator passes, install the branch and run the broader
 focused tests:

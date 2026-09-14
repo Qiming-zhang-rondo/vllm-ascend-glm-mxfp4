@@ -219,7 +219,9 @@ if (BUILD_OPEN_PROJECT)
 
     string(REPLACE "," ";" ASCEND_OP_NAME "${ASCEND_OP_NAME}")
 
-    if (NOT PREPARE_BUILD AND ENABLE_OPS_KERNEL)
+    # The standalone helper runs both prepare and kernel phases explicitly. The
+    # legacy recursive prepare.sh does not forward offline dependency settings.
+    if (NOT PREPARE_BUILD AND ENABLE_OPS_KERNEL AND NOT QLI_STANDALONE_OFFLINE)
         if (TILING_KEY)
             string(REPLACE ";" "::" EP_TILING_KEY "${TILING_KEY}")
         else()

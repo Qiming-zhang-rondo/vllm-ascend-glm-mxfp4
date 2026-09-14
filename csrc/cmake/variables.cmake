@@ -100,7 +100,9 @@ execute_process(
 )
 
 # pack path
-set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/build_out)
+if(NOT QLI_STANDALONE_OFFLINE)
+  set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/build_out)
+endif()
 
 set(OPAPI_INCLUDE
   ${C_SEC_INCLUDE}

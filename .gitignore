@@ -237,3 +237,8 @@ csrc/third_party/
 
 # local build cache
 .vllm_ascend/
+
+# Standalone QLI C4 build cache and benchmark output
+.qli-op-build/
+qli_a5_*.log
+qli_a5_*.json
