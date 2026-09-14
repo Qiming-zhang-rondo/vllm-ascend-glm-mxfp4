@@ -11,9 +11,8 @@
 
 import argparse
 import os
+import re
 import sys
-
-import regex as re
 
 
 def match_op_proto(file_path):

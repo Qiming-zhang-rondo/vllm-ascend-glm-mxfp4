@@ -14,11 +14,11 @@ import datetime
 import glob
 import json
 import os
+import re
 import sys
 
 import const_var
 import opdesc_parser
-import regex as re
 
 PYF_PATH = os.path.dirname(os.path.realpath(__file__))
 
@@ -28,7 +28,7 @@ IMPL_HEAD = '''#!/usr/bin/env python
 Copyright (c) Huawei Technologies Co., Ltd. {}-{}. All rights reserved.
 """
 
-import regex as re
+import re
 import os, sys
 import ctypes
 import json

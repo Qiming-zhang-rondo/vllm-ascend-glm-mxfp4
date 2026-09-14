@@ -14,13 +14,13 @@ import copy
 import hashlib
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from typing import NamedTuple
 
 import const_var
 import opdesc_parser
-import regex as re
 
 PYF_PATH = os.path.dirname(os.path.realpath(__file__))
 
