@@ -5,6 +5,7 @@
 import contextlib
 import ctypes
 import importlib.util
+import shutil
 import tempfile
 import types
 import unittest
@@ -177,6 +178,53 @@ class Harness:
 
 
 class EnumAndLayoutTests(unittest.TestCase):
+    @unittest.skipUnless(
+        any(shutil.which(name) for name in ("c++", "g++", "clang++", "cc")), "needs a local preprocessor"
+    )
+    def test_wrapper_header_follows_nested_includes_and_active_preprocessor_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            include = Path(directory) / "include"
+            acl_dir = include / "acl"
+            nested = acl_dir / "details"
+            nested.mkdir(parents=True)
+            wrapper = acl_dir / "acl_base.h"
+            wrapper.write_text('#include "acl/acl_base_rt.h"\n')
+            (acl_dir / "acl_base_rt.h").write_text('#include "details/types.h"\n')
+            # The inactive declarations deliberately come last: concatenating
+            # header text instead of preprocessing would overwrite live values.
+            (nested / "types.h").write_text(
+                HEADER + "\n#if 0\nenum { ACL_FLOAT = 999, ACL_FLOAT4_E2M1 = 999, ACL_FORMAT_ND = 999 };\n#endif\n"
+            )
+            header, values = backend_module._load_enums(wrapper)
+            self.assertEqual(header, wrapper.resolve())
+            self.assertEqual(values["ACL_FLOAT"], 90)
+            self.assertEqual(values["ACL_FLOAT4_E2M1"], 181)
+            self.assertEqual(values["ACL_FORMAT_ND"], 2)
+
+    @unittest.skipUnless(
+        any(shutil.which(name) for name in ("c++", "g++", "clang++", "cc")), "needs a local preprocessor"
+    )
+    def test_wrapper_header_still_rejects_missing_fp4_after_preprocessing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            wrapper = path / "acl_base.h"
+            wrapper.write_text('#include "types.h"\n')
+            (path / "types.h").write_text(HEADER.replace("ACL_FLOAT4_E2M1", "OLD_TYPE"))
+            with self.assertRaisesRegex(RuntimeError, "ACL_FLOAT4_E2M1"):
+                backend_module._load_enums(wrapper)
+
+    def test_wrapper_header_does_not_invent_constants_when_preprocessor_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            wrapper = path / "acl_base.h"
+            wrapper.write_text('#include "types.h"\n')
+            (path / "types.h").write_text(HEADER)
+            with (
+                patch.object(backend_module.shutil, "which", return_value=None),
+                self.assertRaisesRegex(RuntimeError, "no existing C/C\\+\\+ compiler"),
+            ):
+                backend_module._load_enums(wrapper)
+
     def test_enums_are_read_and_aliases_resolved(self):
         values = backend_module.parse_acl_enums(HEADER)
         self.assertEqual(values["ACL_FLOAT"], 90)

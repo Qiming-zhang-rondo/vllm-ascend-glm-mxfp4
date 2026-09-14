@@ -21,6 +21,8 @@ import ctypes.util
 import importlib
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 I64 = ctypes.c_int64
@@ -146,11 +148,46 @@ def _load_enums(explicit_header, cann_root=None):
         "ACL_FORMAT_ND",
     )
     errors = []
-    for candidate in dict.fromkeys(candidates):
+    for candidate in dict.fromkeys(path.resolve() for path in candidates):
         if not candidate.is_file():
             continue
         enums = parse_acl_enums(candidate.read_text())
         missing = [name for name in required if name not in enums]
+        if missing:
+            # CANN 9.x acl_base.h can forward declarations through #include.
+            # Let the installed preprocessor resolve includes and conditionals;
+            # reading only the wrapper incorrectly reports even ACL_FLOAT absent.
+            compiler = next((path for name in ("c++", "g++", "clang++", "cc") if (path := shutil.which(name))), None)
+            if compiler is None:
+                errors.append(f"{candidate}: header needs preprocessing but no existing C/C++ compiler was found")
+                continue
+            try:
+                expanded = subprocess.run(
+                    [
+                        compiler,
+                        "-E",
+                        "-P",
+                        "-x",
+                        "c++",
+                        "-I",
+                        str(candidate.parent),
+                        "-I",
+                        str(candidate.parent.parent),
+                        str(candidate),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                errors.append(f"{candidate}: preprocessing failed: {error}")
+                continue
+            if expanded.returncode:
+                errors.append(f"{candidate}: preprocessing failed: {expanded.stderr.strip()[-2000:]}")
+                continue
+            enums = parse_acl_enums(expanded.stdout)
+            missing = [name for name in required if name not in enums]
         if not missing:
             return candidate.resolve(), enums
         errors.append(f"{candidate}: missing {', '.join(missing)}")

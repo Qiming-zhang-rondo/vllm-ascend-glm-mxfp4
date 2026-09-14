@@ -194,8 +194,9 @@ def check_prerequisites(repo, cann_root, environ, explicit_json=None):
     acl_header = next((path for path in acl_headers if path.is_file()), None)
     if acl_header is None:
         missing.append("CANN development acl/acl_base.h under " + ", ".join(map(str, acl_headers)))
-    elif "ACL_FLOAT4_E2M1" not in acl_header.read_text(errors="replace"):
-        missing.append(f"A5 FP4-capable CANN headers (ACL_FLOAT4_E2M1 absent from {acl_header})")
+    # CANN 9.x may expose types through includes in acl_base.h. Do not reject a
+    # forwarding header by searching its raw text; compilation resolves those
+    # declarations and the runtime probe checks the actual FP4 enum and compute.
     # Compilation uses the selected, already installed Python and CANN Python modules.
     python_check = subprocess.run(
         [sys.executable, "-c", "import numpy; import tbe"], env=environ, capture_output=True, text=True, check=False
