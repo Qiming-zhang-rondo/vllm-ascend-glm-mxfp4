@@ -312,13 +312,36 @@ def installed_artifacts(install_dir):
     return opapi.resolve(), vendor.resolve()
 
 
-def reusable_manifest(manifest, source_digest, cann_digest, soc):
+def unchanged_clean_build_source(data, repo):
+    """Allow a clean schema-1 build to survive changes outside csrc."""
+    ref = data.get("ref")
+    if (
+        repo is None
+        or data.get("schema_version") != 1
+        or not isinstance(ref, str)
+        or len(ref) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in ref)
+        or data.get("source_digest") != hashlib.sha256(ref.encode()).hexdigest()
+    ):
+        return False
+    try:
+        # Explicitly require the original commit to be available locally. A
+        # missing shallow-history object must never be treated as an empty diff.
+        subprocess.run(["git", "cat-file", "-e", f"{ref}^{{commit}}"], cwd=repo, check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "diff", "--quiet", ref, "--", "csrc"], cwd=repo, check=True)
+        return not subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "csrc"], cwd=repo
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def reusable_manifest(manifest, source_digest, cann_digest, soc, repo=None):
     try:
         data = json.loads(manifest.read_text())
-        if any(
-            data.get(key) != value
-            for key, value in (("source_digest", source_digest), ("cann_digest", cann_digest), ("soc", soc))
-        ):
+        if any(data.get(key) != value for key, value in (("cann_digest", cann_digest), ("soc", soc))):
+            return False
+        if data.get("source_digest") != source_digest and not unchanged_clean_build_source(data, repo):
             return False
         opapi = Path(data["opapi_lib"])
         vendor = Path(data["opp_root"])
@@ -357,7 +380,7 @@ def main(argv=None):
         ref, source_digest = source_identity(repo)
         cann_digest = cann_identity(cann_root, prereqs)
         if args.reuse_only:
-            if reusable_manifest(manifest, source_digest, cann_digest, args.soc):
+            if reusable_manifest(manifest, source_digest, cann_digest, args.soc, repo):
                 print(f"Reuse matching private QLI build: {manifest}")
                 return 0
             print("No matching private QLI build; --reuse-only performed no build or installation.")

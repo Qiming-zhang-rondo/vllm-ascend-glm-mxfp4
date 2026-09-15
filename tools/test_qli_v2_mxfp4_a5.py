@@ -130,6 +130,20 @@ def reference_scores(query: torch.Tensor, key: torch.Tensor, weights: torch.Tens
     return scores
 
 
+def make_host_inputs(args):
+    """Prepare synthetic data on CPU so NPU RNG/broadcast ops are not under test."""
+    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    query = torch.randn(args.query_tokens, args.heads, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator)
+    key = torch.randn(args.key_tokens, 1, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator)
+    # Different D32 magnitudes expose incorrect FP4 scale pairing.
+    amplitude = torch.tensor([0.125, 0.5, 2.0, 8.0], dtype=torch.float16, device="cpu").repeat_interleave(32)
+    query.mul_(amplitude)
+    key.mul_(amplitude.flip(0))
+    weights = torch.rand(args.query_tokens, args.heads, dtype=torch.float32, device="cpu", generator=generator)
+    weights.mul_(1.5).add_(0.25)
+    return query, key, weights
+
+
 def validate_indices(indices: torch.Tensor, query_tokens: int, key_tokens: int, topk: int = TOPK) -> None:
     if indices.shape != (query_tokens, 1, topk) or indices.dtype != torch.int32:
         raise AssertionError(f"Unexpected indices: {tuple(indices.shape)} {indices.dtype}")
@@ -423,25 +437,25 @@ def run(args, report):
         )
         return
 
-    torch.manual_seed(args.seed)
-    torch.npu.manual_seed_all(args.seed)
+    report["stage"] = "CPU input generation and reference"
+    query_host, key_host, weights_host = make_host_inputs(args)
+    original_scores = reference_scores(query_host, key_host, weights_host)
+    print("CPU_INPUT_READY: synthetic inputs and FP32 reference prepared on CPU", flush=True)
+    report["stage"] = "input copy to NPU"
     device = torch.device("npu", args.device)
-    query_source = torch.randn(args.query_tokens, args.heads, HEAD_DIM, dtype=torch.float16, device=device)
-    key_source = torch.randn(args.key_tokens, 1, HEAD_DIM, dtype=torch.float16, device=device)
-    # Vary amplitude by D32 groups: a wrong scale pairing cannot hide behind all-one scales.
-    amplitude = torch.tensor([0.125, 0.5, 2.0, 8.0], dtype=torch.float16, device=device).repeat_interleave(32)
-    query_source.mul_(amplitude)
-    key_source.mul_(amplitude.flip(0))
-    weights = torch.rand(args.query_tokens, args.heads, dtype=torch.float32, device=device) * 1.5 + 0.25
-    cu_q = torch.tensor([0, args.query_tokens], dtype=torch.int32, device=device)
-    seq_k = torch.tensor([args.key_tokens], dtype=torch.int32, device=device)
-    blocks = torch.arange(args.key_tokens // BLOCK_SIZE, dtype=torch.int32, device=device).view(1, -1)
-    original_scores = reference_scores(query_source, key_source, weights)
+    query_source, key_source, weights = (tensor.to(device) for tensor in (query_host, key_host, weights_host))
+    cu_q = torch.tensor([0, args.query_tokens], dtype=torch.int32, device="cpu").to(device)
+    seq_k = torch.tensor([args.key_tokens], dtype=torch.int32, device="cpu").to(device)
+    blocks = torch.arange(args.key_tokens // BLOCK_SIZE, dtype=torch.int32, device="cpu").view(1, -1).to(device)
+    torch.npu.synchronize()
+    print("INPUT_H2D_READY: input copies synchronized", flush=True)
     report["cases"] = {}
     report["timing_scope"] = "Synchronous wall latency including Python/ACLNN preparation, workspace, dispatch and sync"
     print("TIMING:", report["timing_scope"], "; quantization and metadata excluded", flush=True)
     for name, quant_mode in (("MXFP4", QLI_MXFP4), ("FP8", QLI_FP8)):
+        report["stage"] = f"{name} quantization and metadata"
         case = prepare_case(name, quant_mode, query_source, key_source, torch_npu, backend, cu_q, seq_k)
+        print(f"{name}_QUANT_READY: payload, scales and metadata prepared", flush=True)
 
         def invoke(*, key=None, key_scale=None, return_value=0, case=case, quant_mode=quant_mode):
             return backend.invoke(
@@ -461,11 +475,14 @@ def run(args, report):
 
         result = report["cases"][name] = {}
         result["accuracy"] = {}
-        check_case(case, invoke, args, original_scores, weights, result["accuracy"])
+        report["stage"] = f"{name} QLI accuracy checks"
+        print(f"QLI_CALL_BEGIN: {name}", flush=True)
+        check_case(case, invoke, args, original_scores, weights_host, result["accuracy"])
         if quant_mode == QLI_MXFP4:
             report["backend"]["mxfp4_compute_verified"] = True
             report["backend"]["mxfp4_numerical_checks_passed"] = result["accuracy"]["operator_correctness_passed"]
             report["backend"]["capability_note"] = "Actual mode-5 compute completed; see the separate accuracy gates"
+        report["stage"] = f"{name} QLI timing"
         result["wall_latency"] = benchmark_compute(invoke, args.warmup, args.iters)
         print(f"PERF {name}: {json.dumps(result['wall_latency'])}", flush=True)
     mx_p50 = report["cases"]["MXFP4"]["wall_latency"]["p50_ms"]

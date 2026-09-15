@@ -7,6 +7,7 @@ import sys
 if sys.path and os.path.realpath(sys.path[0]) == os.path.dirname(os.path.realpath(__file__)):
     sys.path.pop(0)
 
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -36,6 +37,25 @@ def make_install(prefix):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"mock artifact")
     return vendor
+
+
+def git_commit(repo):
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=QLI Test", "-c", "user.email=qli@example.invalid", "commit", "-qm", "test"],
+        cwd=repo,
+        check=True,
+    )
+
+
+def make_clean_source(repo):
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "csrc").mkdir()
+    (repo / "csrc/kernel.cpp").write_text("original kernel\n")
+    (repo / "benchmark.py").write_text("original benchmark\n")
+    git_commit(repo)
+    return BUILD.source_identity(repo)
 
 
 class TestQliOfflineBuild(unittest.TestCase):
@@ -175,6 +195,69 @@ class TestQliOfflineBuild(unittest.TestCase):
             self.assertFalse(data["device_tested"])
             self.assertTrue(Path(data["opapi_lib"]).is_file())
             self.assertTrue(Path(data["opp_root"]).is_dir())
+
+    def test_python_only_commit_reuses_clean_schema_one_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            ref, old_digest = make_clean_source(repo)
+            self.assertEqual(old_digest, hashlib.sha256(ref.encode()).hexdigest())
+            make_install(root / "install")
+            opapi, vendor = BUILD.installed_artifacts(root / "install")
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "ref": ref,
+                        "source_digest": old_digest,
+                        "cann_digest": "cann",
+                        "soc": "ascend950",
+                        "opapi_lib": str(opapi),
+                        "opp_root": str(vendor),
+                    }
+                )
+            )
+            (repo / "benchmark.py").write_text("CPU input preparation\n")
+            git_commit(repo)
+            _, current_digest = BUILD.source_identity(repo)
+            self.assertNotEqual(old_digest, current_digest)
+            self.assertTrue(BUILD.reusable_manifest(manifest, current_digest, "cann", "ascend950", repo))
+            self.assertFalse(BUILD.reusable_manifest(manifest, current_digest, "new-cann", "ascend950", repo))
+            self.assertFalse(BUILD.reusable_manifest(manifest, current_digest, "cann", "ascend910b", repo))
+            opapi.unlink()
+            self.assertFalse(BUILD.reusable_manifest(manifest, current_digest, "cann", "ascend950", repo))
+
+    def test_legacy_clean_build_rejects_all_csrc_changes(self):
+        for change in ("unstaged", "staged", "committed", "untracked"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory) / "repo"
+                ref, digest = make_clean_source(repo)
+                data = {"schema_version": 1, "ref": ref, "source_digest": digest}
+                if change == "untracked":
+                    (repo / "csrc/new_kernel.h").write_text("new header\n")
+                else:
+                    (repo / "csrc/kernel.cpp").write_text("changed kernel\n")
+                if change == "staged":
+                    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+                elif change == "committed":
+                    git_commit(repo)
+                self.assertFalse(BUILD.unchanged_clean_build_source(data, repo))
+
+    def test_legacy_dirty_build_missing_ref_and_unknown_schema_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            ref, digest = make_clean_source(repo)
+            data = {"schema_version": 1, "ref": ref, "source_digest": digest}
+            self.assertFalse(BUILD.unchanged_clean_build_source({**data, "source_digest": "dirty"}, repo))
+            self.assertFalse(BUILD.unchanged_clean_build_source({**data, "schema_version": 2}, repo))
+            missing_ref = "a" * 40
+            self.assertFalse(
+                BUILD.unchanged_clean_build_source(
+                    {**data, "ref": missing_ref, "source_digest": hashlib.sha256(missing_ref.encode()).hexdigest()},
+                    repo,
+                )
+            )
 
     def test_non_linux_does_not_reuse_a_stale_success_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

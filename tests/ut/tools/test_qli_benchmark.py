@@ -23,6 +23,24 @@ SPEC.loader.exec_module(benchmark)
 
 
 class QLIBenchmarkTests(unittest.TestCase):
+    def test_source_inputs_are_reproducible_cpu_tensors(self):
+        args = SimpleNamespace(query_tokens=2, key_tokens=2048, heads=4, seed=123)
+        first = benchmark.make_host_inputs(args)
+        second = benchmark.make_host_inputs(args)
+        for actual, repeated, shape, dtype in zip(
+            first, second, ((2, 4, 128), (2048, 1, 128), (2, 4)), (torch.float16, torch.float16, torch.float32)
+        ):
+            self.assertEqual(actual.device.type, "cpu")
+            self.assertEqual(tuple(actual.shape), shape)
+            self.assertEqual(actual.dtype, dtype)
+            self.assertTrue(actual.is_contiguous())
+            torch.testing.assert_close(actual, repeated, rtol=0, atol=0)
+        args.seed += 1
+        self.assertFalse(torch.equal(first[0], benchmark.make_host_inputs(args)[0]))
+        scores = benchmark.reference_scores(*first)
+        self.assertEqual(scores.device.type, "cpu")
+        self.assertTrue(torch.isfinite(scores[:, :2047]).all())
+
     def test_decode_all_codes_signed_zero_and_nibble_order(self):
         packed = torch.tensor([0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE], dtype=torch.uint8).repeat(8)
         decoded = benchmark.decode_mxfp4(packed.reshape(1, 1, 64), torch.full((1, 1, 2, 2), 127, dtype=torch.uint8))
