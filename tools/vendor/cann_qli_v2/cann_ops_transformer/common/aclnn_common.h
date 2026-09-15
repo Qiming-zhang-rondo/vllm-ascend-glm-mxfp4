@@ -27,6 +27,7 @@
 #include <sstream>
 #include <cerrno>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -301,6 +302,14 @@ inline void *GetOpApiFuncAddrInLib(void *handler, const char *libName, const cha
     auto funcAddr = dlsym(handler, apiName);
     if (funcAddr == nullptr) {
         ASCEND_LOGW("dlsym %s from %s failed, error:%s.", apiName, libName, dlerror());
+    } else if (std::strncmp(apiName, "aclnnQuantLightningIndexerV2", sizeof("aclnnQuantLightningIndexerV2") - 1) == 0) {
+        Dl_info info{};
+        const char *resolvedPath = "unknown";
+        if (dladdr(funcAddr, &info) != 0 && info.dli_fname != nullptr) {
+            resolvedPath = info.dli_fname;
+        }
+        std::fprintf(stderr, "QLIV2_API_LIBRARY: %s = %s\n", apiName, resolvedPath);
+        std::fflush(stderr);
     }
     return funcAddr;
 }

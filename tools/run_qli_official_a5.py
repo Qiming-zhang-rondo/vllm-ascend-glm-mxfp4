@@ -16,7 +16,34 @@ from pathlib import Path
 DEFAULT_CASES = "MXFP4_PA_20,MXFP4_META_70_002"
 PERF_CASES = DEFAULT_CASES + ",FP8_PA_04,FP8_META_70_002"
 
-PERF_BOOTSTRAP = r"""
+RUNTIME_BOOTSTRAP = r"""
+import os, sys
+private_opp = sys.argv.pop(1)
+os.environ['ASCEND_CUSTOM_OPP_PATH'] = private_opp
+
+def restore_private_opp():
+    imported_opp = os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')
+    os.environ['ASCEND_CUSTOM_OPP_PATH'] = private_opp
+    print('QLIV2_CUSTOM_OPP_PATH: ' + private_opp, flush=True)
+    if imported_opp != private_opp:
+        print('QLIV2_IGNORED_IMPORT_OPP_PATH: ' + imported_opp, flush=True)
+"""
+
+PYTEST_BOOTSTRAP = (
+    RUNTIME_BOOTSTRAP
+    + r"""
+import torch, torch_npu
+restore_private_opp()
+import pytest
+sys.exit(pytest.main(sys.argv[1:]))
+"""
+)
+
+PERF_BOOTSTRAP = (
+    RUNTIME_BOOTSTRAP
+    + r"""
+import torch, torch_npu
+restore_private_opp()
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location('qli_official_perf_plugin', sys.argv[1])
 plugin = importlib.util.module_from_spec(spec)
@@ -25,8 +52,11 @@ spec.loader.exec_module(plugin)
 import pytest
 sys.exit(pytest.main(sys.argv[2:], plugins=[plugin]))
 """
+)
 
-PREFLIGHT = r"""
+PREFLIGHT = (
+    RUNTIME_BOOTSTRAP
+    + r"""
 import importlib, json, sys
 errors = []
 modules = {}
@@ -36,6 +66,7 @@ for name in ('torch', 'torch_npu', 'numpy', 'pandas', 'pytest'):
         modules[name] = {'version': getattr(module, '__version__', None), 'path': module.__file__}
     except Exception as error:
         errors.append(f'{name}: {error}')
+restore_private_opp()
 if not errors:
     import torch
     for dtype in ('float4_e2m1fn_x2', 'float8_e8m0fnu'):
@@ -58,6 +89,7 @@ if not errors and '--perf' in sys.argv:
 print(json.dumps({'modules': modules, 'errors': errors}, indent=2), flush=True)
 sys.exit(2 if errors else 0)
 """
+)
 
 
 def run_test(*, repo, test_dir, run_dir, command, environment, cases, opapi):
@@ -196,6 +228,11 @@ def main(argv=None):
             "ASCEND_GLOBAL_LOG_LEVEL": "3" if args.perf else "0",
             "ASCEND_SLOG_PRINT_TO_STDOUT": "0",
             "ASCEND_LAUNCH_BLOCKING": "1",
+            # Import torch_npu explicitly; unrelated backend plugins can prepend
+            # their custom OPP vendor and shadow the QLI package under test.
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            # fla_npu's wheel also prepends its vendor during Python site startup.
+            "FLA_NPU_DISABLE_PTH": "1",
             "TORCH_EXTENSIONS_DIR": str(repo / ".qli-official/torch_extensions"),
             "MAX_JOBS": environment.get("MAX_JOBS", "2"),
             "PYTHONPATH": os.pathsep.join([str(source), environment.get("PYTHONPATH", "")]).rstrip(os.pathsep),
@@ -230,7 +267,7 @@ def main(argv=None):
         flush=True,
     )
     checked = subprocess.run(
-        [sys.executable, "-c", PREFLIGHT] + (["--perf"] if args.perf else []),
+        [sys.executable, "-c", PREFLIGHT, str(vendor)] + (["--perf"] if args.perf else []),
         cwd=source,
         env=environment,
         capture_output=True,
@@ -245,8 +282,9 @@ def main(argv=None):
     test_dir = source / "pytest"
     command = [
         sys.executable,
-        "-m",
-        "pytest",
+        "-c",
+        PYTEST_BOOTSTRAP,
+        str(vendor),
         "-c",
         str(test_dir / "pytest.ini"),
         "-x",
@@ -292,8 +330,8 @@ def main(argv=None):
         child_report_path = child_dir / "performance.json"
         child_environment = dict(environment, QLIV2_CASE_NAMES=case_name)
         child_command = (
-            [sys.executable, "-c", PERF_BOOTSTRAP, str(repo / "tools/qli_official_perf_plugin.py")]
-            + command[3:]
+            [sys.executable, "-c", PERF_BOOTSTRAP, str(vendor), str(repo / "tools/qli_official_perf_plugin.py")]
+            + command[4:]
             + [
                 "--qli-perf-output",
                 str(child_report_path),

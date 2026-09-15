@@ -7,7 +7,9 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,9 +69,10 @@ class TestOfficialLauncher(unittest.TestCase):
         self.run.assert_called_once()
         self.popen.assert_called_once()
         command = self.popen.call_args.args[0]
-        self.assertEqual(command[:3], [launcher.sys.executable, "-m", "pytest"])
+        self.assertEqual(command[:4], [launcher.sys.executable, "-c", launcher.PYTEST_BOOTSTRAP, str(self.vendor)])
         self.assertEqual(command[-1], str(self.test_dir / "test_quant_lightning_indexer_v2_single.py"))
-        self.assertEqual(command[command.index("-c") + 1], str(self.test_dir / "pytest.ini"))
+        pytest_args = command[4:]
+        self.assertEqual(pytest_args[pytest_args.index("-c") + 1], str(self.test_dir / "pytest.ini"))
         self.assertIn("-x", command)
         self.assertEqual(self.popen.call_args.kwargs["cwd"], self.test_dir)
         environment = self.popen.call_args.kwargs["env"]
@@ -85,6 +88,8 @@ class TestOfficialLauncher(unittest.TestCase):
             "ASCEND_OPP_PATH": str(self.cann / "opp"),
             "ASCEND_CUSTOM_OPP_PATH": str(self.vendor),
             "ASCEND_LAUNCH_BLOCKING": "1",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "FLA_NPU_DISABLE_PTH": "1",
         }
         for name, value in expected.items():
             self.assertEqual(environment[name], value, name)
@@ -94,7 +99,9 @@ class TestOfficialLauncher(unittest.TestCase):
             [str(self.opapi.parent), str(self.cann / "lib64"), "/container/lib"],
         )
         self.assertEqual(self.run.call_args.kwargs["env"], environment)
-        self.assertEqual(self.run.call_args.args[0][:2], [launcher.sys.executable, "-c"])
+        self.assertEqual(
+            self.run.call_args.args[0], [launcher.sys.executable, "-c", launcher.PREFLIGHT, str(self.vendor)]
+        )
         run_dir = Path(environment["ASCEND_PROCESS_LOG_PATH"]).parent
         self.assertEqual((run_dir / "official.log").read_text(), "official test output\n")
         self.assertFalse((run_dir / "collection.log").exists())
@@ -140,12 +147,23 @@ class TestOfficialLauncher(unittest.TestCase):
         for call in self.popen.call_args_list:
             environment = call.kwargs["env"]
             self.assertEqual(environment["ASCEND_LAUNCH_BLOCKING"], "1")
+            self.assertEqual(environment["TORCH_DEVICE_BACKEND_AUTOLOAD"], "0")
             self.assertEqual(environment["ASCEND_GLOBAL_LOG_LEVEL"], "3")
             names.append(environment["QLIV2_CASE_NAMES"])
             plogs.append(environment["ASCEND_PROCESS_LOG_PATH"])
             command = call.args[0]
-            self.assertEqual(command[:2], [launcher.sys.executable, "-c"])
-            self.assertEqual(command[3], str(self.repo / "tools/qli_official_perf_plugin.py"))
+            self.assertEqual(
+                command[:5],
+                [
+                    launcher.sys.executable,
+                    "-c",
+                    launcher.PERF_BOOTSTRAP,
+                    str(self.vendor),
+                    str(self.repo / "tools/qli_official_perf_plugin.py"),
+                ],
+            )
+            pytest_args = command[5:]
+            self.assertEqual(pytest_args[pytest_args.index("-c") + 1], str(self.test_dir / "pytest.ini"))
             self.assertIn(str(self.test_dir / "test_quant_lightning_indexer_v2_single.py"), command)
             self.assertEqual(command[command.index("--qli-perf-warmup") + 1], "3")
             self.assertEqual(command[command.index("--qli-perf-iters") + 1], "7")
@@ -224,6 +242,141 @@ class TestOfficialLauncher(unittest.TestCase):
         self.assertEqual(metadata["plog_dir"], str(plog))
         self.assertEqual(metadata["command"], self.popen.call_args.args[0])
         self.assertEqual((run_dir / "collection.log").read_text(), "collector output\ncollector warning\n")
+
+
+class TestRuntimeBootstrap(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.output = self.root / "observed.json"
+        self.events = self.root / "events.jsonl"
+        self.private_opp = str(self.root / "private operator package")
+        self.environment = dict(
+            os.environ,
+            PYTHONPATH=str(self.root),
+            TORCH_DEVICE_BACKEND_AUTOLOAD="0",
+            ASCEND_CUSTOM_OPP_PATH="/old/container/vendor",
+            BOOTSTRAP_EXPECTED_OPP=self.private_opp,
+            BOOTSTRAP_OUTPUT=str(self.output),
+            BOOTSTRAP_EVENTS=str(self.events),
+        )
+        modules = {
+            "bootstrap_checks.py": """
+                import json, os
+                def check(stage):
+                    actual = os.environ.get('ASCEND_CUSTOM_OPP_PATH')
+                    assert actual == os.environ['BOOTSTRAP_EXPECTED_OPP'], (stage, actual)
+                    with open(os.environ['BOOTSTRAP_EVENTS'], 'a') as output:
+                        output.write(json.dumps(stage) + '\\n')
+                def forbid_npu(*args, **kwargs):
+                    raise AssertionError('Bootstrap must not execute NPU operations')
+            """,
+            "torch.py": """
+                import os
+                from types import SimpleNamespace
+                from bootstrap_checks import check, forbid_npu
+                assert os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] == '0'
+                check('torch_import')
+                float4_e2m1fn_x2 = object()
+                float8_e8m0fnu = object()
+                ops = SimpleNamespace(cann_ops_transformer=SimpleNamespace(
+                    quant_lightning_indexer=forbid_npu,
+                    quant_lightning_indexer_metadata=forbid_npu,
+                ))
+                class NPU:
+                    def __getattr__(self, name):
+                        forbid_npu()
+                npu = NPU()
+            """,
+            "torch_npu.py": """
+                import os
+                from types import SimpleNamespace
+                from bootstrap_checks import check, forbid_npu
+                check('torch_npu_import')
+                os.environ['ASCEND_CUSTOM_OPP_PATH'] = (
+                    '/bundled/torch_npu/vendor:' + os.environ['ASCEND_CUSTOM_OPP_PATH']
+                )
+                profiler = SimpleNamespace(**{name: forbid_npu for name in (
+                    'profile', 'tensorboard_trace_handler', '_ExperimentalConfig', 'ProfilerLevel', 'ExportType'
+                )})
+            """,
+            "numpy.py": "__version__ = 'fake-cpu-only'\n",
+            "pandas.py": "__version__ = 'fake-cpu-only'\n",
+            "cann_ops_transformer.py": """
+                from bootstrap_checks import check
+                check('official_registration')
+            """,
+            "pytest.py": """
+                import json, os
+                from bootstrap_checks import check
+                if os.environ['BOOTSTRAP_KIND'] != 'preflight':
+                    check('pytest_import')
+                def main(args, plugins=None):
+                    check('pytest_main')
+                    import cann_ops_transformer
+                    with open(os.environ['BOOTSTRAP_OUTPUT'], 'w') as output:
+                        json.dump({'args': args, 'plugins': [item.__name__ for item in plugins or []]}, output)
+                    return 19
+            """,
+            "fake_plugin.py": """
+                import pytest
+                from bootstrap_checks import check
+                check('plugin_import')
+            """,
+        }
+        for filename, content in modules.items():
+            (self.root / filename).write_text(textwrap.dedent(content))
+
+    def run_bootstrap(self, bootstrap, arguments, kind):
+        return subprocess.run(
+            [sys.executable, "-S", "-c", bootstrap, self.private_opp, *arguments],
+            env=dict(self.environment, BOOTSTRAP_KIND=kind),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    def test_preflight_restores_private_package_before_official_registration(self):
+        result = self.run_bootstrap(launcher.PREFLIGHT, ["--perf"], "preflight")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('"errors": []', result.stdout)
+        self.assertIn("QLIV2_IGNORED_IMPORT_OPP_PATH: /bundled/torch_npu/vendor:", result.stdout)
+        self.assertEqual(
+            [json.loads(line) for line in self.events.read_text().splitlines()],
+            ["torch_import", "torch_npu_import", "official_registration"],
+        )
+        self.assertFalse(self.output.exists(), "Preflight must not invoke pytest or NPU operators")
+
+    def test_accuracy_and_performance_restore_private_package_and_forward_pytest_arguments(self):
+        pytest_args = ["-c", "fixture with spaces/pytest.ini", "-x", "-m", "ci", "official_case.py"]
+        for perf in (False, True):
+            with self.subTest(perf=perf):
+                self.events.unlink(missing_ok=True)
+                arguments = list(pytest_args)
+                if perf:
+                    arguments += ["--qli-perf-output", "result with spaces.json", "--qli-perf-iters", "7"]
+                expected_args = list(arguments)
+                if perf:
+                    arguments.insert(0, str(self.root / "fake_plugin.py"))
+                result = self.run_bootstrap(
+                    launcher.PERF_BOOTSTRAP if perf else launcher.PYTEST_BOOTSTRAP,
+                    arguments,
+                    "performance" if perf else "accuracy",
+                )
+                self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+                self.assertEqual(
+                    json.loads(self.output.read_text()),
+                    {"args": expected_args, "plugins": ["qli_official_perf_plugin"] if perf else []},
+                )
+                self.assertEqual(
+                    [json.loads(line) for line in self.events.read_text().splitlines()],
+                    ["torch_import", "torch_npu_import", "pytest_import"]
+                    + (["plugin_import"] if perf else [])
+                    + ["pytest_main", "official_registration"],
+                )
+                self.assertIn("QLIV2_IGNORED_IMPORT_OPP_PATH: /bundled/torch_npu/vendor:", result.stdout)
 
 
 if __name__ == "__main__":

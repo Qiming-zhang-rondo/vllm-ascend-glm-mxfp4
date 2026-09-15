@@ -2,7 +2,7 @@
   "schema_version": 1,
   "repository": "https://gitcode.com/cann/ops-transformer",
   "ref": "55498d91634277d4eec912499c027818a8c167fb",
-  "scope": "Unmodified upstream QLI V2 Torch host binding and registration; no ctypes backend, setup.py, dependency installation, or NPU kernel build.",
+  "scope": "Upstream QLI V2 Torch host binding and registration with one local diagnostic patch recording the actual resolved QLI API library; no ctypes backend, setup.py, dependency installation, or NPU kernel build.",
   "files": [
     {
       "path": "LICENSE",
@@ -22,7 +22,8 @@
     {
       "path": "cann_ops_transformer/common/aclnn_common.h",
       "upstream_path": "torch_extension/cann_ops_transformer/common/aclnn_common.h",
-      "sha256": "61f638958922cab6c8227cccc071b9df3e44e2426357d29eca23f043fbf92df1"
+      "sha256": "132aca7e4246468344d6f50eb25efefb437f5b0d94a5d8930cf7a3b7fd064579",
+      "original_sha256": "61f638958922cab6c8227cccc071b9df3e44e2426357d29eca23f043fbf92df1"
     },
     {
       "path": "cann_ops_transformer/csrc/attention/quant_lightning_indexer.cpp",
@@ -57,5 +58,14 @@
     ],
     "operator_package": "Official aclnn_common.h resolves existing custom op_api libraries from ASCEND_CUSTOM_OPP_PATH before built-in libraries.",
     "cann_root": "Official OpBuilder uses ASCEND_HOME_PATH when it names an existing directory; otherwise it falls back relative to torch_npu."
-  }
+  },
+  "local_diagnostic_changes": [
+    {
+      "path": "cann_ops_transformer/common/aclnn_common.h",
+      "function": "GetOpApiFuncAddrInLib",
+      "change": "After a successful dlsym for an API prefixed aclnnQuantLightningIndexerV2, print the owning library from dladdr to stderr and flush; print unknown if dladdr cannot identify it. Search order, dispatch, tensor descriptors and operator behavior are unchanged.",
+      "original_sha256": "61f638958922cab6c8227cccc071b9df3e44e2426357d29eca23f043fbf92df1",
+      "sha256": "132aca7e4246468344d6f50eb25efefb437f5b0d94a5d8930cf7a3b7fd064579"
+    }
+  ]
 }

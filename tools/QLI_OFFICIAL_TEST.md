@@ -10,6 +10,11 @@ git -C /workspace/vllm-ascend-glm-mxfp4-optest pull --ff-only && python3 /worksp
 `cann_ops_transformer` C++ bridge 调用已经安装的私有算子。
 不运行自写 benchmark/smoke，不重新编译 NPU kernel。
 首次运行会用容器现有 C++ 编译器和 ninja 编译一个官方 host bridge，后续复用缓存。
+入口在子进程启动前设置 `FLA_NPU_DISABLE_PTH=1`，关闭 fla_npu 的 Python `.pth`
+路径注入钩子，并关闭 PyTorch 第三方后端自动导入。显式导入容器的 torch_npu，随后恢复私有
+`ASCEND_CUSTOM_OPP_PATH`，避免第三方包在导入时把自己的 vendor 插到测试算子之前。
+这些设置仅作用于测试子进程。桥接解析接口时打印 `QLIV2_API_LIBRARY`，记录实际
+函数所属的库；启动时打印的 manifest 路径本身不能证明最终命中的库。
 需要容器已有 torch、torch_npu、numpy、pandas、pytest、编译器及 CANN 开发头文件；
 缺失时停止并报告，不执行 pip、不下载依赖、不操作镜像。
 
@@ -36,7 +41,7 @@ git -C /workspace/vllm-ascend-glm-mxfp4-optest pull --ff-only && python3 /worksp
 预热 5 次，再用容器已有的 `torch_npu.profiler` 采集 20 次计算。
 profiler 导出使用容器已有的 CANN `msprof`；入口会查找现有安装路径，不会下载或安装。
 用 `--warmup N --iters N` 调整次数，用 `--cases` 选择官方 STC 用例。
-官方用例、golden、比较阈值和 C++ bridge 均未因性能功能而修改。
+官方用例、golden、比较阈值和 C++ 调用入参未因性能功能而修改。
 
 终端打印每个用例的 p50、p90、平均耗时（微秒），以及两组 FP8/C4 的 p50 比值。
 比值大于 1 表示该 shape 下 C4 的设备任务耗时更短。
@@ -67,6 +72,10 @@ profiler 导出使用容器已有的 CANN `msprof`；入口会查找现有安装
 - `run.json`：用例、进程 PID 和指定的私有算子库。
 - `diagnostic.json`：失败时提取的 kernel 信息、错误日志和故障 PC 附近反汇编（工具可用时）。
 
+比较通过与失败的运行时，应核对 `QLIV2_API_LIBRARY`、完整用例参数及 plog 的
+kernel 名称、tiling key。相同 dtype 或同名算子不等于同一 kernel specialization。
+诊断中的私有包反汇编候选也不能单独证明该二进制就是实际执行的 kernel。
+
 失败后提供本次打印的 `official.log` 和 `diagnostic.json` 即可；完整 plog 仍在上述目录。
 单独查看已有 benchmark 超时的日志，无需再次执行算子：
 
@@ -81,4 +90,7 @@ python3 /workspace/vllm-ascend-glm-mxfp4-optest/tools/collect_qli_timeout.py
 记录上游文件路径与 SHA256，原始 CANN 许可证保存在同目录。
 测试文件唯一兼容性修改是删除 golden 中未使用的 `import test`，
 避免要求容器安装 CPython 自身的测试包；用例、golden 和精度阈值均未修改。
-最小 Python 包入口只导入 QLI，复用原始 builder、C++ bridge 和公共头文件。
+最小 Python 包入口只导入 QLI，复用原始 builder 和 C++ bridge。
+公共头文件只增加实际 QLI API 归属库的 `dladdr` 日志，不改变解析顺序或算子行为；
+`BRIDGE_SOURCE_MANIFEST.json` 保留原始和修改后的 SHA256。更新此头文件后，ninja
+可能重新编译 host bridge，仍不重新编译 NPU kernel，也不下载依赖。
