@@ -109,19 +109,88 @@ class TestOfficialLauncher(unittest.TestCase):
         self.assertFalse((run_dir / "official.log").exists())
         self.assertFalse((run_dir / "run.json").exists())
 
-    def test_performance_uses_official_cases_and_disables_debug_synchronization(self):
+    def mock_perf_process(self, command, *, env, **unused):
+        name = env["QLIV2_CASE_NAMES"]
+        output = Path(command[command.index("--qli-perf-output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "cases": {
+                        name: {
+                            "status": "passed",
+                            "official_accuracy_passed": True,
+                            "shape": {"q_seq": 1, "k_seq": 128},
+                            "performance": {"p50_us": 2.0 if name.startswith("MXFP4") else 4.0},
+                        }
+                    },
+                }
+            )
+        )
+        return SimpleNamespace(
+            pid=43210 + self.popen.call_count, stdout=iter([f"passed {name}\n"]), wait=Mock(return_value=0)
+        )
+
+    def test_performance_isolates_cases_and_preserves_verified_launch_mode(self):
+        self.popen.side_effect = self.mock_perf_process
         self.assertEqual(launcher.main(["--perf", "--warmup", "3", "--iters", "7"]), 0)
-        environment = self.popen.call_args.kwargs["env"]
-        self.assertEqual(environment["ASCEND_LAUNCH_BLOCKING"], "0")
-        self.assertEqual(environment["ASCEND_GLOBAL_LOG_LEVEL"], "3")
-        self.assertEqual(environment["QLIV2_CASE_NAMES"], launcher.PERF_CASES)
-        command = self.popen.call_args.args[0]
-        self.assertEqual(command[:2], [launcher.sys.executable, "-c"])
-        self.assertEqual(command[3], str(self.repo / "tools/qli_official_perf_plugin.py"))
-        self.assertIn(str(self.test_dir / "test_quant_lightning_indexer_v2_single.py"), command)
-        self.assertEqual(command[command.index("--qli-perf-warmup") + 1], "3")
-        self.assertEqual(command[command.index("--qli-perf-iters") + 1], "7")
+        self.assertEqual(self.popen.call_count, 4)
+        names, plogs, outputs = [], [], []
+        for call in self.popen.call_args_list:
+            environment = call.kwargs["env"]
+            self.assertEqual(environment["ASCEND_LAUNCH_BLOCKING"], "1")
+            self.assertEqual(environment["ASCEND_GLOBAL_LOG_LEVEL"], "3")
+            names.append(environment["QLIV2_CASE_NAMES"])
+            plogs.append(environment["ASCEND_PROCESS_LOG_PATH"])
+            command = call.args[0]
+            self.assertEqual(command[:2], [launcher.sys.executable, "-c"])
+            self.assertEqual(command[3], str(self.repo / "tools/qli_official_perf_plugin.py"))
+            self.assertIn(str(self.test_dir / "test_quant_lightning_indexer_v2_single.py"), command)
+            self.assertEqual(command[command.index("--qli-perf-warmup") + 1], "3")
+            self.assertEqual(command[command.index("--qli-perf-iters") + 1], "7")
+            outputs.append(Path(command[command.index("--qli-perf-output") + 1]))
+        self.assertEqual(names, launcher.PERF_CASES.split(","))
+        self.assertEqual(len(set(plogs)), 4)
+        self.assertEqual(len(set(outputs)), 4)
+        aggregate = json.loads((outputs[0].parents[1] / "performance.json").read_text())
+        self.assertEqual(aggregate["status"], "passed")
+        self.assertEqual(len(aggregate["cases"]), 4)
+        self.assertEqual(len(aggregate["comparisons"]), 2)
+        self.assertTrue(all(item["fp8_over_mxfp4_p50"] == 2.0 for item in aggregate["comparisons"]))
         self.assertIn("--perf", self.run.call_args.args[0])
+
+    def test_performance_stops_after_first_failed_case(self):
+        def fail_first(command, **kwargs):
+            process = self.mock_perf_process(command, **kwargs)
+            output = Path(command[command.index("--qli-perf-output") + 1])
+            name = kwargs["env"]["QLIV2_CASE_NAMES"]
+            output.write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "cases": {
+                            name: {
+                                "status": "accuracy_failed",
+                                "official_accuracy_passed": False,
+                            }
+                        },
+                    }
+                )
+            )
+            process.wait.return_value = 1
+            return process
+
+        self.popen.side_effect = fail_first
+        self.assertEqual(launcher.main(["--perf"]), 1)
+        self.popen.assert_called_once()
+        command = self.popen.call_args.args[0]
+        output = Path(command[command.index("--qli-perf-output") + 1])
+        aggregate = json.loads((output.parents[1] / "performance.json").read_text())
+        self.assertEqual(aggregate["status"], "failed")
+        self.assertEqual(aggregate["failed_case"], "MXFP4_PA_20")
+        self.assertEqual(aggregate["cases"]["MXFP4_PA_20"]["status"], "accuracy_failed")
+        self.assertEqual(aggregate["comparisons"], [])
 
     def test_pytest_failure_preserves_status_and_collects_exact_run(self):
         self.process.wait.return_value = 7

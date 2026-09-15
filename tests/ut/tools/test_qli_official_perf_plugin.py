@@ -20,6 +20,27 @@ SPEC.loader.exec_module(plugin)
 
 
 class OfficialPerfTests(unittest.TestCase):
+    def test_argument_snapshot_reads_descriptors_without_device_operations(self):
+        tensor = SimpleNamespace(
+            shape=(1, 64, 64),
+            dtype="torch.float4_e2m1fn_x2",
+            device="npu:0",
+            stride=lambda: (4096, 64, 1),
+            storage_offset=lambda: 0,
+        )
+        self.assertEqual(
+            plugin.describe_argument(tensor),
+            {
+                "shape": [1, 64, 64],
+                "dtype": "torch.float4_e2m1fn_x2",
+                "device": "npu:0",
+                "stride": [4096, 64, 1],
+                "storage_offset": 0,
+            },
+        )
+        self.assertEqual(plugin.describe_argument(5), 5)
+        self.assertIsNone(plugin.describe_argument(None))
+
     def test_profiler_excludes_warmup_and_reuses_exact_call_arguments(self):
         events = []
         args, kwargs = (object(), object()), {"metadata": object()}
@@ -134,7 +155,14 @@ sys.exit(status)
                 self.assertEqual(state["perf"], 1 if passed else 0)
                 report = json.loads(output.read_text())
                 self.assertEqual(report["status"], "passed" if passed else "failed")
-                self.assertEqual(len(report["cases"]), 1 if passed else 0)
+                self.assertEqual(len(report["cases"]), 1)
+                entry = report["cases"]["MXFP4_PA_20"]
+                self.assertEqual(entry["status"], "passed" if passed else "accuracy_failed")
+                self.assertEqual(entry["official_accuracy_passed"], passed)
+                self.assertEqual(entry["compute_arguments"]["positional"], ["original-query"])
+                self.assertEqual(entry["compute_arguments"]["keyword"], {"metadata": "original-metadata"})
+                if not passed:
+                    self.assertNotIn("performance", entry)
 
     def test_profile_failure_preserves_accuracy_success(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):

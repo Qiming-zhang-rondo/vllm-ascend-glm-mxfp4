@@ -53,6 +53,19 @@ def pytest_configure(config):
     save_report(config)
 
 
+def describe_argument(value):
+    """Read tensor descriptors only: no device copies, item(), or synchronization."""
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "stride": list(value.stride()),
+            "storage_offset": value.storage_offset(),
+        }
+    return value
+
+
 def profile_call(op, args, kwargs, trace_dir, warmup, iterations):
     import torch
     import torch_npu
@@ -98,16 +111,16 @@ def pytest_pyfunc_call(pyfuncitem):
     captured = []
 
     def capture(*args, **kwargs):
+        entry["compute_arguments"] = {
+            "scope": "Actual arguments before QLI launch; tensor descriptors only, payload values not captured",
+            "positional": [describe_argument(value) for value in args],
+            "keyword": {key: describe_argument(value) for key, value in kwargs.items()},
+        }
+        save_report(pyfuncitem.config)
         outputs = op(*args, **kwargs)
         captured.append((args, kwargs))
         return outputs
 
-    # Upstream still generates inputs, invokes the original C++ bridge, and
-    # performs all its original accuracy assertions before profiling can begin.
-    with patch.object(namespace, "quant_lightning_indexer", capture):
-        pyfuncitem.obj(param_combinations=pyfuncitem.funcargs["param_combinations"])
-    if len(captured) != 1:
-        raise RuntimeError(f"Expected one official QLI compute call, captured {len(captured)}")
     params = pyfuncitem.funcargs["param_combinations"]
     name = params["case_name"]
     config = pyfuncitem.config
@@ -138,8 +151,8 @@ def pytest_pyfunc_call(pyfuncitem):
     )
     trace_dir = Path(config.getoption("--qli-perf-output")).parent / "profiler" / name
     entry = {
-        "status": "accuracy_passed",
-        "official_accuracy_passed": True,
+        "status": "accuracy_running",
+        "official_accuracy_passed": False,
         "quant_mode": params["quant_mode"],
         "shape": {key: params.get(key) for key in shape_keys},
         "trace_dir": str(trace_dir),
@@ -147,6 +160,20 @@ def pytest_pyfunc_call(pyfuncitem):
         "iterations": config.getoption("--qli-perf-iters"),
     }
     config._qli_perf_report["cases"][name] = entry
+    save_report(config)
+    print(f"\nSTAGE: official accuracy: {name}", flush=True)
+    # Upstream still generates inputs, invokes the original C++ bridge, and
+    # performs all its original accuracy assertions before profiling can begin.
+    try:
+        with patch.object(namespace, "quant_lightning_indexer", capture):
+            pyfuncitem.obj(param_combinations=params)
+        if len(captured) != 1:
+            raise RuntimeError(f"Expected one official QLI compute call, captured {len(captured)}")
+    except Exception as error:
+        entry.update(status="accuracy_failed", error=f"{type(error).__name__}: {error}")
+        save_report(config)
+        raise
+    entry.update(status="accuracy_passed", official_accuracy_passed=True)
     save_report(config)
     print(
         f"\nPERF BEGIN: {name}; official accuracy passed; warmup={entry['warmup']}, samples={entry['iterations']}",

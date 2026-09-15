@@ -30,6 +30,8 @@ git -C /workspace/vllm-ascend-glm-mxfp4-optest pull --ff-only && python3 /worksp
 ```
 
 默认增加相同 shape 的 `FP8_PA_04` 和 `FP8_META_70_002`，共四个官方用例。
+按指定顺序执行，默认先 C4 后 FP8；每个用例启动独立 Python 进程，共用已有 JIT 磁盘缓存。
+首个失败即停止，避免前一个用例的进程内 profiler 状态影响后续用例。
 每个用例先执行完整官方精度检查，通过后复用该次实际输入、metadata 和原始 C++ 调用，
 预热 5 次，再用容器已有的 `torch_npu.profiler` 采集 20 次计算。
 profiler 导出使用容器已有的 CANN `msprof`；入口会查找现有安装路径，不会下载或安装。
@@ -38,13 +40,18 @@ profiler 导出使用容器已有的 CANN `msprof`；入口会查找现有安装
 
 终端打印每个用例的 p50、p90、平均耗时（微秒），以及两组 FP8/C4 的 p50 比值。
 比值大于 1 表示该 shape 下 C4 的设备任务耗时更短。
-完整数据保存在本次目录的 `performance.json`，原始 CSV 在 `profiler/<用例>/`。
+完整数据保存在本次目录的 `performance.json`；各用例的日志、报告、原始 CSV
+分别位于 `01/`、`02/` 等子目录，CSV 的完整路径记录在报告中。
 
 统计值取自 CANN `op_summary*.csv` 的 QLI compute `Task Duration(us)`。
 这是 profiler 下的设备任务耗时，包含设备任务调度、执行和完成响应，不能称为纯指令执行时间。
 输入生成、H2D、量化、metadata、首次 JIT、精度比较、预热及 CPU 提交间隔不计入这个字段。
-性能子进程关闭 `ASCEND_LAUNCH_BLOCKING` 和详细调试日志，退出不改变容器原有环境。
+性能子进程保留已通过精度检查时的 `ASCEND_LAUNCH_BLOCKING=1`，降低调试日志级别。
+因此结果是同步启动条件下的设备任务耗时，不代表生产异步吞吐；退出不改变容器原有环境。
 采样为空、异常或数量不符时，保留 trace 并报错，不输出伪造的性能值。
+每例报告区分 `accuracy_failed` 和 `performance_failed`，并在 QLI 调用前记录
+`compute_arguments`：实际 tensor shape、dtype、stride、offset 和标量参数。
+该记录不读取 tensor 数值、不增加 NPU 同步；它不包含可用于逐字节复现的 Q/K payload。
 
 两种量化模式使用相同 shape、各自的官方合成数据。这不衡量 C4 相对原始高精度输入的量化损失，
 也不验证 GLM 端到端精度；上述小 shape 的性能不能直接代表 GLM 生产负载。
@@ -52,6 +59,7 @@ profiler 导出使用容器已有的 CANN `msprof`；入口会查找现有安装
 ## 输出和诊断
 
 每次输出保存在 `.qli-official/<时间>/`：
+精度模式的日志在该目录；性能模式每例的以下日志位于 `01/`、`02/` 等子目录。
 
 - `preflight.log`：容器依赖检查。
 - `official.log`：官方 pytest 的完整输出。
