@@ -30,6 +30,7 @@ git -C /workspace/vllm-ascend-glm-mxfp4-optest pull --ff-only && python3 /worksp
 设备任务 P50 分别为 8.377 μs、9.257 μs。两组 META 的完整性能尚未核实。
 旧大 shape 也已完成计算与计时，但 C4 量化损失门槛未通过；不能记录为整体 Pass。
 详细错误复盘、结果口径和遗留问题见 [A5 验证记录](QLI_A5_VALIDATION_NOTES.md)。
+完整 56K prompt、每块 8192 个 Q token 的目标负载测试见 [chunked prefill 用法](QLI_CHUNKED_PREFILL.md)。
 
 ## 同时测精度和性能
 

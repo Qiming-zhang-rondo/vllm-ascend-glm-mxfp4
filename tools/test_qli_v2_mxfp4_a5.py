@@ -69,6 +69,9 @@ def parse_args(argv=None):
             default=cast(value) if value is not None else default,
         )
     parser.add_argument("--heads", type=int, default=64)
+    parser.add_argument("--prefill-tokens", type=int, help="Process this full prompt as causal prefill chunks")
+    parser.add_argument("--chunk-size", type=int, default=8192, help="Q tokens per prefill chunk (default: 8192)")
+    parser.add_argument("--reference-rows", type=int, default=16, help="CPU accuracy sample rows per prefill chunk")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--check-only", action="store_true", help="Run a small real MXFP4 compute smoke test only.")
@@ -78,9 +81,22 @@ def parse_args(argv=None):
     parser.add_argument("--cann-root", help="Existing container CANN toolkit root")
     parser.add_argument("--output", type=Path, default=Path("qli_a5_results.json"))
     args = parser.parse_args(argv)
+    if args.prefill_tokens is not None:
+        if args.prefill_tokens < BLOCK_SIZE or args.prefill_tokens % BLOCK_SIZE:
+            parser.error("--prefill-tokens must be positive and aligned to the 128-token cache block")
+        if args.chunk_size < BLOCK_SIZE or args.chunk_size % BLOCK_SIZE:
+            parser.error("--chunk-size must be positive and aligned to the 128-token cache block")
+        if args.reference_rows < 5:
+            parser.error("--reference-rows must be at least 5 to cover causal and TopK boundaries")
+        if args.check_cache_layout:
+            parser.error("--check-cache-layout is not implemented for chunked prefill")
+        if args.max_mxfp4_p50_ms is not None:
+            parser.error("--max-mxfp4-p50-ms is a single-call gate; it does not apply to a prefill chunk sequence")
+        args.query_tokens = min(args.chunk_size, args.prefill_tokens)
+        args.key_tokens = args.prefill_tokens
     if not 1 <= args.query_tokens <= args.key_tokens:
         parser.error("--query-tokens must be within the key sequence")
-    if args.key_tokens % BLOCK_SIZE or args.key_tokens < TOPK + args.query_tokens - 1:
+    if args.key_tokens % BLOCK_SIZE or (args.prefill_tokens is None and args.key_tokens < TOPK + args.query_tokens - 1):
         parser.error(f"--key-tokens must be a multiple of {BLOCK_SIZE} and cover top-{TOPK} for every query")
     if not 1 <= args.heads <= 64:
         parser.error("--heads must be in [1, 64]")
@@ -130,10 +146,23 @@ def round_fp64_to_bf16(values: torch.Tensor) -> torch.Tensor:
     return torch.where(values.abs() >= info.tiny, normal, subnormal).float().bfloat16()
 
 
-def reference_scores(query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, quant_mode=None) -> torch.Tensor:
+def reference_scores(
+    query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, quant_mode=None, *, causal_lengths=None
+) -> torch.Tensor:
     query_cpu = query.detach().cpu().float()
     key_cpu = key.detach().cpu().float().reshape(-1, 1, HEAD_DIM)[:, 0]
     weights_cpu = weights.detach().cpu().float()
+    if causal_lengths is None:
+        causal_lengths = [key_cpu.shape[0] - query_cpu.shape[0] + index + 1 for index in range(query_cpu.shape[0])]
+    else:
+        causal_lengths = torch.as_tensor(causal_lengths, device="cpu")
+        if causal_lengths.ndim != 1 or causal_lengths.numel() != query_cpu.shape[0]:
+            raise ValueError("Each reference query needs its original causal K length")
+        if causal_lengths.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Causal K lengths must be integers")
+        causal_lengths = causal_lengths.tolist()
+    if any(length < 1 or length > key_cpu.shape[0] for length in causal_lengths):
+        raise ValueError("Causal K lengths must be within the provided key prefix")
     rows = []
     # Bound the temporary [T,N,K] allocation for chunked-query tests.
     for first in range(0, query_cpu.shape[0], 8):
@@ -151,8 +180,7 @@ def reference_scores(query: torch.Tensor, key: torch.Tensor, weights: torch.Tens
         else:
             rows.append((correlations.relu() * weights_cpu[first : first + 8].unsqueeze(-1)).sum(dim=1))
     scores = torch.cat(rows)
-    for query_index in range(query_cpu.shape[0]):
-        causal_length = key_cpu.shape[0] - query_cpu.shape[0] + query_index + 1
+    for query_index, causal_length in enumerate(causal_lengths):
         scores[query_index, causal_length:] = -torch.inf
     return scores
 
@@ -527,6 +555,22 @@ def run(args, report):
         report["backend"]["mxfp4_compute_verified"] = True
         report["backend"]["capability_note"] = (
             "Actual mode-5 smoke completed; full numerical/performance tests were not run"
+        )
+        return
+
+    if args.prefill_tokens is not None:
+        prefill_path = Path(__file__).resolve().with_name("qli_chunked_prefill.py")
+        prefill_spec = importlib.util.spec_from_file_location("qli_chunked_prefill", prefill_path)
+        prefill_module = importlib.util.module_from_spec(prefill_spec)
+        prefill_spec.loader.exec_module(prefill_module)
+        prefill_module.run_prefill(
+            args,
+            report,
+            backend,
+            torch.device("npu", args.device),
+            prepare_case=prepare_case,
+            reference_scores=reference_scores,
+            benchmark_compute=benchmark_compute,
         )
         return
 

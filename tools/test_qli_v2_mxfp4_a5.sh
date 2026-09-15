@@ -47,6 +47,12 @@ Launcher options:
 
 Benchmark options are forwarded to the Python runner, for example:
   --query-tokens 1 --key-tokens 8192 --warmup 5 --iterations 20 --output result.json
+  --prefill-tokens 57344 --chunk-size 8192 --reference-rows 16 --output prefill_56k.json
+
+Prefill runs the full prompt in causal Q chunks with growing K prefixes.
+Numeric reference checks sample rows; QLI timing excludes preparation and metadata.
+For a downloaded launcher, disable FLA's Python startup hook before invocation:
+  FLA_NPU_DISABLE_PTH=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 bash test_qli.sh --update ...
 
 Within a checkout no code is fetched unless --update is supplied.
 Existing checkouts and local edits are never moved or deleted.

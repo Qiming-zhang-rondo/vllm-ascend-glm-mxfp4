@@ -23,6 +23,38 @@ SPEC.loader.exec_module(benchmark)
 
 
 class QLIBenchmarkTests(unittest.TestCase):
+    def test_prefill_parameters_describe_seven_8192_token_chunks(self):
+        args = benchmark.parse_args(["--prefill-tokens", "57344", "--chunk-size", "8192"])
+        self.assertEqual((args.query_tokens, args.key_tokens, args.reference_rows), (8192, 57344, 16))
+        self.assertEqual(args.prefill_tokens // args.chunk_size, 7)
+        for options in (
+            ["--prefill-tokens", "57345"],
+            ["--prefill-tokens", "57344", "--chunk-size", "0"],
+            ["--prefill-tokens", "57344", "--reference-rows", "4"],
+            ["--prefill-tokens", "57344", "--check-cache-layout"],
+            ["--prefill-tokens", "57344", "--max-mxfp4-p50-ms", "1"],
+        ):
+            with self.subTest(options=options), self.assertRaises(SystemExit), patch("sys.stderr"):
+                benchmark.parse_args(options)
+
+    def test_sampled_reference_preserves_original_prefill_causal_positions(self):
+        generator = torch.Generator().manual_seed(91)
+        # Exactly representable data isolates mask positions from BLAS rounding
+        # differences when the sampled and complete batches have different M.
+        q = torch.randint(-2, 3, (8, 3, 128), generator=generator).float()
+        k = torch.randint(-2, 3, (8, 1, 128), generator=generator).float()
+        w = torch.randint(1, 4, (8, 3), generator=generator).float() * 0.5
+        rows = torch.tensor([0, 3, 7])
+        for mode in (1, 5):
+            full = benchmark.reference_scores(q, k, w, quant_mode=mode)
+            sampled = benchmark.reference_scores(q[rows], k, w[rows], quant_mode=mode, causal_lengths=rows + 1)
+            torch.testing.assert_close(sampled, full[rows], rtol=0, atol=0)
+            self.assertTrue(torch.isneginf(sampled[0, 1:]).all())
+            self.assertEqual(torch.isfinite(sampled).sum(dim=1).tolist(), [1, 4, 8])
+        for lengths in ([0, 4, 8], [1, 4, 9], [1, 4], [1.0, 4.0, 8.0], [[1, 4, 8]]):
+            with self.subTest(lengths=lengths), self.assertRaises(ValueError):
+                benchmark.reference_scores(q[rows], k, w[rows], causal_lengths=lengths)
+
     def test_cpu_preparation_accuracy_and_timing_for_both_modes_without_npu_quantizers(self):
         # Exercise orchestration with CPU outputs standing in for ACLNN, not a
         # hardware correctness test. The NPU namespace has no quantization API.
