@@ -31,6 +31,7 @@ HEAD_DIM = 128
 BLOCK_SIZE = 128
 QLI_FP8 = 1
 QLI_MXFP4 = 5
+BF16_SIGNIFICAND_BITS = 8
 
 
 class ExistingOperatorUnavailable(RuntimeError):
@@ -114,7 +115,18 @@ def decode_fp8(payload: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return values * factors.unsqueeze(-1)
 
 
-def reference_scores(query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+def round_fp64_to_bf16(values: torch.Tensor) -> torch.Tensor:
+    """Round directly to BF16 RNE, avoiding an intermediate FP32 double rounding."""
+    values = values.double()
+    mantissa, exponent = torch.frexp(values)
+    normal = torch.ldexp(torch.round(mantissa * (2**BF16_SIGNIFICAND_BITS)), exponent - BF16_SIGNIFICAND_BITS)
+    info = torch.finfo(torch.bfloat16)
+    subnormal_step = info.tiny * info.eps
+    subnormal = torch.round(values / subnormal_step) * subnormal_step
+    return torch.where(values.abs() >= info.tiny, normal, subnormal).float().bfloat16()
+
+
+def reference_scores(query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, quant_mode=None) -> torch.Tensor:
     query_cpu = query.detach().cpu().float()
     key_cpu = key.detach().cpu().float().reshape(-1, 1, HEAD_DIM)[:, 0]
     weights_cpu = weights.detach().cpu().float()
@@ -122,7 +134,18 @@ def reference_scores(query: torch.Tensor, key: torch.Tensor, weights: torch.Tens
     # Bound the temporary [T,N,K] allocation for chunked-query tests.
     for first in range(0, query_cpu.shape[0], 8):
         correlations = torch.matmul(query_cpu[first : first + 8], key_cpu.transpose(0, 1))
-        rows.append((correlations.relu() * weights_cpu[first : first + 8].unsqueeze(-1)).sum(dim=1))
+        if quant_mode == QLI_MXFP4:
+            # CANN ops-transformer@632dddba, quant_lightning_indexer_v2_golden.py
+            # reduce_mxfp4_weighted_qk: BF16 QK/ReLU, BF16 weights, and a BF16
+            # destination FMA rounded after EACH head (not an FP32 sum).
+            correlations = correlations.relu().bfloat16().double()
+            head_weights = weights_cpu[first : first + 8].bfloat16().double()
+            accum = torch.zeros((correlations.shape[0], correlations.shape[-1]), dtype=torch.bfloat16)
+            for head in range(correlations.shape[1]):
+                accum = round_fp64_to_bf16(accum.double() + head_weights[:, head : head + 1] * correlations[:, head])
+            rows.append(accum.float())
+        else:
+            rows.append((correlations.relu() * weights_cpu[first : first + 8].unsqueeze(-1)).sum(dim=1))
     scores = torch.cat(rows)
     for query_index in range(query_cpu.shape[0]):
         causal_length = key_cpu.shape[0] - query_cpu.shape[0] + query_index + 1
@@ -272,7 +295,7 @@ def check_case(case, invoke, args, original_scores, weights, result) -> dict:
     validate_indices(indices, args.query_tokens, args.key_tokens)
     if values.dtype != torch.bfloat16:
         raise AssertionError(f"Expected BF16 sparse values, got {values.dtype}")
-    scores = reference_scores(case["decoded_query"], case["decoded_key"], weights)
+    scores = reference_scores(case["decoded_query"], case["decoded_key"], weights, quant_mode=case["quant_mode"])
     decoded = accuracy_metrics(indices, values, scores)
     original = accuracy_metrics(indices, values, original_scores)
     decoded_passed = decoded["selected_scores_close"] and decoded["selection_above_tolerated_cutoff"]
@@ -283,6 +306,7 @@ def check_case(case, invoke, args, original_scores, weights, result) -> dict:
     )
     result.update(
         {
+            "compute_reference": "BF16 QK/weights and per-head BF16 FMA" if case["quant_mode"] == QLI_MXFP4 else "FP32",
             "decoded_payload_reference": decoded,
             "original_fp16_input_reference": original,
             "operator_correctness_passed": decoded_passed,

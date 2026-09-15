@@ -23,6 +23,24 @@ SPEC.loader.exec_module(benchmark)
 
 
 class QLIBenchmarkTests(unittest.TestCase):
+    def test_bf16_rounding_avoids_fp32_double_rounding_at_ties(self):
+        values = torch.tensor([1 + 2**-8, 1 + 3 * 2**-8, 1 + 2**-8 + 2**-30, 2**-134, 3 * 2**-134], dtype=torch.float64)
+        expected = torch.tensor([1.0, 1 + 2**-6, 1 + 2**-7, 0.0, 2**-132], dtype=torch.bfloat16)
+        torch.testing.assert_close(benchmark.round_fp64_to_bf16(values), expected, rtol=0, atol=0)
+        self.assertNotEqual(values[2].float().bfloat16(), expected[2])
+
+    def test_mxfp4_reference_rounds_each_head_before_causal_mask(self):
+        query = torch.zeros(2, 3, 128)
+        query[:, :, 0] = 1
+        key = torch.zeros(3, 1, 128)
+        key[:, 0, 0] = 1
+        weights = torch.tensor([[1.0, 2**-8, 2**-8], [1.0, 2**-8, 2**-8]])
+        actual = benchmark.reference_scores(query, key, weights, quant_mode=benchmark.QLI_MXFP4)
+        # Both half-ULP additions round back to the even BF16 value 1.0.
+        expected = torch.tensor([[1.0, 1.0, -torch.inf], [1.0, 1.0, 1.0]])
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(benchmark.reference_scores(query, key, weights)[0, 0], 1 + 2**-7)
+
     def test_smoke_prepares_random_inputs_on_cpu_and_reports_compute_stage(self):
         original_randn = torch.randn
 
