@@ -26,7 +26,10 @@ git -C /workspace/vllm-ascend-glm-mxfp4-optest pull --ff-only && python3 /worksp
 | `MXFP4_META_70_002` | BSND，Q=4、K=641、H=64、D=128、TopK=64，检查 indices 和 scores |
 
 不加 `--perf` 时仅检查官方精度，子进程启用详细 plog 和同步执行。
-用户已在 A5 报告官方精度用例 `PASSED`；新增性能采集尚待 A5 实测。
+2026-09-15 用户 A5 实测：`MXFP4_PA_20`、`FP8_PA_04` 精度和各 20 次性能采样通过，
+设备任务 P50 分别为 8.377 μs、9.257 μs。两组 META 的完整性能尚未核实。
+旧大 shape 也已完成计算与计时，但 C4 量化损失门槛未通过；不能记录为整体 Pass。
+详细错误复盘、结果口径和遗留问题见 [A5 验证记录](QLI_A5_VALIDATION_NOTES.md)。
 
 ## 同时测精度和性能
 

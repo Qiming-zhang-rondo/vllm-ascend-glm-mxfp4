@@ -9,6 +9,10 @@
 - Preserve the passing launch configuration when adding profiling. In this container the verified accuracy path uses `ASCEND_LAUNCH_BLOCKING=1`; do not silently switch it off for a device-task timing measurement. Isolate quantization cases in fresh processes and stop on the first failure.
 - Distinguish official operator correctness, quantization loss against original inputs, and model accuracy. Name the timing scope precisely; CANN Task Duration is a device-task measurement, not Python wall time.
 - Preserve per-run logs and plog. Do not claim A5 verification from CPU-only tests or loosen accuracy thresholds to obtain a pass.
+- For this QLI container, set `FLA_NPU_DISABLE_PTH=1` before starting Python; `TORCH_DEVICE_BACKEND_AUTOLOAD=0` does not disable Python site `.pth` hooks. The official launcher handles both; a downloaded legacy shell script needs the environment prefix.
+- Verify actual ACLNN symbol ownership, and distinguish it from OPP tiling/device-kernel ownership. Neither a manifest path nor a matching dtype proves which specialization executed. Do not record a timeout hypothesis as a confirmed kernel or tiling fix.
+- Read the final JSON gates even when compute and timing complete. The 2026-09-15 large-shape run passed both operator-correctness checks but failed MXFP4 quantization recall (89.6484% against a 90% gate); keep that failure visible.
+- Preserve the different timing scopes: official small-shape device-task latency and legacy large-shape Python/ACLNN wall latency cannot be compared directly. See [QLI A5 validation notes](tools/QLI_A5_VALIDATION_NOTES.md) for verified results, errors, evidence and remaining limits.
 
 This document provides instructions for contributors to the vLLM Ascend project. Please read and follow these guidelines to ensure code quality, maintainability, and consistency.
 
