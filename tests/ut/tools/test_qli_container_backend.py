@@ -382,6 +382,27 @@ class AclCallTests(unittest.TestCase):
         self.assertEqual(caught.exception.phase, "execute")
         self.assertEqual(harness.events[harness.events.index("execute") + 1], "synchronize")
 
+    def test_sync_failures_identify_before_and_after_aclnn_launch(self):
+        for failing_call, label in ((1, "BEFORE"), (2, "AFTER")):
+            with self.subTest(label=label):
+                harness = Harness()
+                backend = harness.make_backend()
+                sync_calls = 0
+
+                def sync(device, failing_call=failing_call):
+                    nonlocal sync_calls
+                    sync_calls += 1
+                    if sync_calls == failing_call:
+                        raise RuntimeError("507014 test timeout")
+
+                harness.torch.npu.synchronize = sync
+                with self.assertRaisesRegex(RuntimeError, f"aclnnQuantLightningIndexerV2: .*{label} ACLNN launch"):
+                    backend.invoke(**harness.inputs())
+                self.assertEqual("execute" in harness.events, failing_call == 2)
+                destroyed = [event[1] for event in harness.events if isinstance(event, tuple) and event[0] == "destroy"]
+                self.assertEqual(len(destroyed), len(harness.descriptors))
+                self.assertEqual(len(set(destroyed)), len(destroyed))
+
     def test_unaligned_scale_rejected_before_acl_submission(self):
         harness = Harness()
         backend = harness.make_backend()

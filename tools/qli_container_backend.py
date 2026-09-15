@@ -389,7 +389,10 @@ class QLIBackend:
         workspace = None
         submitted = False
         try:
-            self.torch.npu.synchronize(device)
+            try:
+                self.torch.npu.synchronize(device)
+            except RuntimeError as error:
+                raise RuntimeError(f"{api_name}: pending NPU work failed BEFORE ACLNN launch: {error}") from error
             workspace_size, executor = U64(), PTR()
             status = self._api[api_name + "GetWorkspaceSize"](
                 *arguments,
@@ -411,7 +414,10 @@ class QLIBackend:
             # necessary before dropping workspace and input descriptor owners.
             try:
                 if submitted:
-                    self.torch.npu.synchronize(device)
+                    try:
+                        self.torch.npu.synchronize(device)
+                    except RuntimeError as error:
+                        raise RuntimeError(f"{api_name}: synchronization failed AFTER ACLNN launch: {error}") from error
             finally:
                 for handle, *_ in reversed(handles):
                     self._destroy_tensor(handle)

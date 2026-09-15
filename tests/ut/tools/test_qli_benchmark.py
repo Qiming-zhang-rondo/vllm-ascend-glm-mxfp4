@@ -23,6 +23,43 @@ SPEC.loader.exec_module(benchmark)
 
 
 class QLIBenchmarkTests(unittest.TestCase):
+    def test_smoke_prepares_random_inputs_on_cpu_and_reports_compute_stage(self):
+        original_randn = torch.randn
+
+        def cpu_random(*args, **kwargs):
+            self.assertEqual(kwargs.get("device"), "cpu")
+            return original_randn(*args, **kwargs)
+
+        case = {name: torch.zeros(1) for name in ("query", "key", "query_scale", "key_scale", "metadata")}
+        indices = torch.arange(benchmark.TOPK, dtype=torch.int32).view(1, 1, -1)
+        values = torch.ones(indices.shape, dtype=torch.bfloat16)
+        backend = SimpleNamespace(invoke=lambda **kwargs: (indices, values))
+        report = {}
+        with (
+            patch.object(torch, "randn", side_effect=cpu_random) as random,
+            patch.object(torch, "npu", SimpleNamespace(synchronize=lambda: None), create=True),
+            patch.object(benchmark, "prepare_case", return_value=case),
+        ):
+            result = benchmark.smoke_test(backend, None, torch.device("cpu"), report=report)
+        self.assertEqual(random.call_count, 2)
+        self.assertTrue(result["passed"])
+        self.assertEqual(report["stage"], "smoke: QLI compute")
+
+    def test_smoke_input_sync_failure_stops_before_quantization(self):
+        report = {}
+
+        def fail_sync():
+            raise RuntimeError("input transfer failed")
+
+        with (
+            patch.object(torch, "npu", SimpleNamespace(synchronize=fail_sync), create=True),
+            patch.object(benchmark, "prepare_case") as prepare,
+            self.assertRaisesRegex(RuntimeError, "input transfer failed"),
+        ):
+            benchmark.smoke_test(None, None, torch.device("cpu"), report=report)
+        prepare.assert_not_called()
+        self.assertEqual(report["stage"], "smoke: CPU input preparation and copy to NPU")
+
     def test_source_inputs_are_reproducible_cpu_tensors(self):
         args = SimpleNamespace(query_tokens=2, key_tokens=2048, heads=4, seed=123)
         first = benchmark.make_host_inputs(args)

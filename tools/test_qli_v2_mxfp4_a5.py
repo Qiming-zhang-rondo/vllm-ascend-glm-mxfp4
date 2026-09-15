@@ -224,7 +224,10 @@ def quantize_mxfp4(x: torch.Tensor, npu_ops) -> tuple[torch.Tensor, torch.Tensor
     return payload, scale
 
 
-def prepare_case(name, quant_mode, q_source, k_source, npu_ops, backend, cu_q, seq_k):
+def prepare_case(name, quant_mode, q_source, k_source, npu_ops, backend, cu_q, seq_k, report=None):
+    if report is not None:
+        report["stage"] = f"{name}: input quantization and payload readback"
+        print("STAGE:", report["stage"], flush=True)
     if quant_mode == QLI_MXFP4:
         query, query_scale = quantize_mxfp4(q_source, npu_ops)
         key, key_scale = quantize_mxfp4(k_source, npu_ops)
@@ -239,6 +242,9 @@ def prepare_case(name, quant_mode, q_source, k_source, npu_ops, backend, cu_q, s
         key = key.reshape(-1, BLOCK_SIZE, 1, HEAD_DIM)
         key_scale = key_scale.float().reshape(-1, BLOCK_SIZE, 1)
         decoded_q, decoded_k = decode_fp8(query, query_scale), decode_fp8(key, key_scale)
+    if report is not None:
+        report["stage"] = f"{name}: QLI metadata"
+        print("STAGE:", report["stage"], flush=True)
     metadata = backend.create_metadata(
         num_heads_q=q_source.shape[1],
         head_dim=HEAD_DIM,
@@ -314,20 +320,30 @@ def check_case(case, invoke, args, original_scores, weights, result) -> dict:
     return result
 
 
-def smoke_test(backend, npu_ops, device, quant_mode=QLI_MXFP4):
+def smoke_test(backend, npu_ops, device, quant_mode=QLI_MXFP4, report=None):
     """Test the actual mode-5 compute op, rather than just exported metadata."""
-    query_source = torch.randn(1, 64, HEAD_DIM, dtype=torch.float16, device=device)
-    key_source = torch.randn(TOPK, 1, HEAD_DIM, dtype=torch.float16, device=device)
-    cu_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    seq_k = torch.tensor([TOPK], dtype=torch.int32, device=device)
-    case = prepare_case("QLI smoke", quant_mode, query_source, key_source, npu_ops, backend, cu_q, seq_k)
+    if report is not None:
+        report["stage"] = "smoke: CPU input preparation and copy to NPU"
+        print("STAGE:", report["stage"], flush=True)
+    generator = torch.Generator(device="cpu").manual_seed(20260911)
+    query_source = torch.randn(1, 64, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator).to(device)
+    key_source = torch.randn(TOPK, 1, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator).to(device)
+    cu_q = torch.tensor([0, 1], dtype=torch.int32, device="cpu").to(device)
+    seq_k = torch.tensor([TOPK], dtype=torch.int32, device="cpu").to(device)
+    weights = torch.ones((1, 64), dtype=torch.float32, device="cpu").to(device)
+    blocks = torch.arange(TOPK // BLOCK_SIZE, dtype=torch.int32, device="cpu").view(1, -1).to(device)
+    torch.npu.synchronize()
+    case = prepare_case("QLI smoke", quant_mode, query_source, key_source, npu_ops, backend, cu_q, seq_k, report)
+    if report is not None:
+        report["stage"] = "smoke: QLI compute"
+        print("STAGE:", report["stage"], flush=True)
     indices, values = backend.invoke(
         query=case["query"],
         key=case["key"],
-        weights=torch.ones((1, 64), dtype=torch.float32, device=device),
+        weights=weights,
         query_scale=case["query_scale"],
         key_scale=case["key_scale"],
-        block_table=torch.arange(TOPK // BLOCK_SIZE, dtype=torch.int32, device=device).view(1, -1),
+        block_table=blocks,
         metadata=case["metadata"],
         cu_seqlens_q=cu_q,
         seqused_k=seq_k,
@@ -353,7 +369,7 @@ def can_probe_fp8_control(error):
 
 def run_smoke(backend, npu_ops, device, report, call_error_type):
     try:
-        report["smoke"] = smoke_test(backend, npu_ops, device)
+        report["smoke"] = smoke_test(backend, npu_ops, device, report=report)
     except call_error_type as error:
         report["smoke"] = {
             "quant_mode": QLI_MXFP4,
@@ -364,7 +380,7 @@ def run_smoke(backend, npu_ops, device, report, call_error_type):
         }
         if can_probe_fp8_control(error):
             try:
-                report["fp8_control"] = smoke_test(backend, npu_ops, device, quant_mode=QLI_FP8)
+                report["fp8_control"] = smoke_test(backend, npu_ops, device, quant_mode=QLI_FP8, report=report)
             except Exception as control_error:
                 report["fp8_control"] = {"passed": False, "error": str(control_error)}
                 raise error
@@ -454,7 +470,7 @@ def run(args, report):
     print("TIMING:", report["timing_scope"], "; quantization and metadata excluded", flush=True)
     for name, quant_mode in (("MXFP4", QLI_MXFP4), ("FP8", QLI_FP8)):
         report["stage"] = f"{name} quantization and metadata"
-        case = prepare_case(name, quant_mode, query_source, key_source, torch_npu, backend, cu_q, seq_k)
+        case = prepare_case(name, quant_mode, query_source, key_source, torch_npu, backend, cu_q, seq_k, report)
         print(f"{name}_QUANT_READY: payload, scales and metadata prepared", flush=True)
 
         def invoke(*, key=None, key_scale=None, return_value=0, case=case, quant_mode=quant_mode):
