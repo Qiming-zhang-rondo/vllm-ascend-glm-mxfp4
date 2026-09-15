@@ -5,6 +5,35 @@ operator with MXFP4. A metadata API symbol alone does not establish support.
 If that capability is absent, `build_qli_v2_mxfp4_a5.sh` can build this checkout's
 QLI V2 compute and metadata operators into a private directory.
 
+For an existing downloaded `test_qli.sh`, update and run with:
+
+```bash
+bash test_qli.sh --update
+```
+
+The default test prepares both C4 and FP8 on CPU from the same finite FP16
+inputs. C4 uses packed E2M1 bytes and D32 E8M0 scales; FP8 uses E4M3FN and
+per-row FP32 scales. The A5 executes the real QLI V2 metadata and compute
+operators. NPU DynamicMxQuant/DynamicQuant are not invoked. CPU packing does
+not replace the A5 compute with dequantized arithmetic.
+
+The producer rules follow CANN `ops-nn@2a77283db46e6648ff47bc8277442cf9c721e3c2`,
+`quant/dynamic_mx_quant/tests/assets/golden.py` and
+`quant/dynamic_quant/tests/assets/golden.py`. The C4 compute reference follows
+`ops-transformer@632dddba712a4e6cace3f8b44f198aef8a82ce3e`,
+`attention/quant_lightning_indexer_v2/tests/pytest/quant_lightning_indexer_v2_golden.py`
+(`reduce_mxfp4_weighted_qk`). Error against the original FP16 inputs is also
+reported using a separate FP32 reference. This tests QLI with synthetic inputs,
+not the runtime quantizer or GLM model accuracy.
+
+Default output includes C4/FP8 accuracy and synchronous call latency; descriptor
+and workspace preparation, dispatch and synchronization are included, while
+input preparation and metadata are excluded. Accuracy thresholds are evaluated
+after both modes have produced their timing results. Optional
+`--check-cache-layout` additionally exercises padded, offset cache views;
+the default uses contiguous paged cache. `--check-only` runs a small real C4
+compute smoke test without the full benchmark.
+
 This helper does not install vLLM, vLLM-Ascend, PyTorch, torch_npu, CANN, or a
 container image. It does not invoke a package manager or download source archives.
 It uses the container's existing Python, CANN development toolkit, compilers,

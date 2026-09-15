@@ -23,6 +23,149 @@ SPEC.loader.exec_module(benchmark)
 
 
 class QLIBenchmarkTests(unittest.TestCase):
+    def test_cpu_preparation_accuracy_and_timing_for_both_modes_without_npu_quantizers(self):
+        # Exercise orchestration with CPU outputs standing in for ACLNN, not a
+        # hardware correctness test. The NPU namespace has no quantization API.
+        args = benchmark.parse_args(["--heads", "4", "--key-tokens", "4096", "--warmup", "1", "--iters", "2"])
+        q, k, weights = benchmark.make_host_inputs(args)
+        metadata_modes, completed = [], []
+
+        def create_metadata(**kwargs):
+            metadata_modes.append(kwargs["quant_mode"])
+            return torch.empty(1024, dtype=torch.int32)
+
+        with (
+            patch.object(torch, "npu", SimpleNamespace(synchronize=lambda: None), create=True),
+            patch("builtins.print"),
+        ):
+            for name, mode in (("MXFP4", 5), ("FP8", 1)):
+                case = benchmark.prepare_case(
+                    name,
+                    mode,
+                    q,
+                    k,
+                    torch.device("cpu"),
+                    SimpleNamespace(create_metadata=create_metadata),
+                    torch.tensor([0, 1], dtype=torch.int32),
+                    torch.tensor([4096], dtype=torch.int32),
+                    {},
+                )
+                self.assertEqual(case["query"].dtype, torch.uint8 if mode == 5 else torch.float8_e4m3fn)
+                self.assertEqual(case["key_scale"].dtype, torch.uint8 if mode == 5 else torch.float32)
+                scores = benchmark.reference_scores(
+                    case["decoded_query"], case["decoded_key"], weights, quant_mode=mode
+                )
+                selected = scores.topk(benchmark.TOPK, dim=-1)
+                indices = selected.indices.int().unsqueeze(1)
+                values = selected.values.bfloat16().unsqueeze(1)
+                calls = []
+
+                def invoke(*, return_value=0, calls=calls, indices=indices, values=values):
+                    # Passing strided key/scale arguments would fail this test.
+                    calls.append(return_value)
+                    return indices, values if return_value else torch.empty(0, dtype=torch.bfloat16)
+
+                accuracy = {}
+                # Force the original-input gate to fail while keeping valid
+                # decoded-payload scores, so timing must still be reachable.
+                benchmark.check_case(case, invoke, args, torch.zeros_like(scores), weights, accuracy)
+                self.assertTrue(accuracy["operator_correctness_passed"])
+                self.assertFalse(accuracy["quantization_thresholds_passed"])
+                self.assertEqual(accuracy["cache_layout_check"], "not requested")
+                latency = benchmark.benchmark_compute(invoke, args.warmup, args.iters)
+                self.assertEqual(latency["iterations"], 2)
+                self.assertEqual(calls, [1, 0, 0, 0, 0])
+                completed.append(name)
+        self.assertEqual(completed, ["MXFP4", "FP8"])
+        self.assertEqual(metadata_modes, [5, 1])
+
+    def test_cpu_mxfp4_ties_away_from_zero_and_low_nibble_first(self):
+        x = torch.full((1, 1, 128), 6.0, dtype=torch.float16)
+        x[0, 0, :16] = torch.tensor(
+            [
+                0.0,
+                0.25,
+                0.75,
+                1.25,
+                1.75,
+                2.5,
+                3.5,
+                5.0,
+                -0.0,
+                -0.25,
+                -0.75,
+                -1.25,
+                -1.75,
+                -2.5,
+                -3.5,
+                -5.0,
+            ]
+        )
+        payload, scales = benchmark.quantize_mxfp4_cpu(x)
+        expected = torch.tensor([0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE], dtype=torch.uint8)
+        torch.testing.assert_close(payload[0, 0, :8], expected, rtol=0, atol=0)
+        torch.testing.assert_close(scales, torch.full((1, 1, 2, 2), 127, dtype=torch.uint8), rtol=0, atol=0)
+        for tensor in (payload, scales):
+            self.assertEqual(tensor.device.type, "cpu")
+            self.assertEqual(tensor.dtype, torch.uint8)
+            self.assertTrue(tensor.is_contiguous())
+
+    def test_cpu_mxfp4_zero_scale_and_fp16_min_subnormal(self):
+        x = torch.zeros((1, 1, 128), dtype=torch.float16)
+        x[0, 0, 1] = -0.0
+        x[0, 0, 32] = 2**-24
+        payload, scales = benchmark.quantize_mxfp4_cpu(x)
+        self.assertEqual(payload[0, 0, 0], 0x80)
+        self.assertEqual(payload[0, 0, 16], 0x06)
+        torch.testing.assert_close(scales.flatten(), torch.tensor([0, 101, 0, 0], dtype=torch.uint8), rtol=0, atol=0)
+        torch.testing.assert_close(benchmark.decode_mxfp4(payload, scales), x.float(), rtol=0, atol=0)
+
+    def test_cpu_mxfp4_independent_d32_scales_and_saturation(self):
+        x = (torch.tensor([0.5, 2.0, 8.0, 32.0], dtype=torch.float16).repeat_interleave(32)).reshape(1, 1, 128)
+        payload, scales = benchmark.quantize_mxfp4_cpu(x)
+        torch.testing.assert_close(
+            scales.flatten(), torch.tensor([124, 126, 128, 130], dtype=torch.uint8), rtol=0, atol=0
+        )
+        torch.testing.assert_close(payload, torch.full_like(payload, 0x66), rtol=0, atol=0)
+        torch.testing.assert_close(benchmark.decode_mxfp4(payload, scales), x.float(), rtol=0, atol=0)
+        x = torch.full((1, 1, 128), 7.5, dtype=torch.float16)
+        x[..., 1::2] = -7.5
+        payload, scales = benchmark.quantize_mxfp4_cpu(x)
+        torch.testing.assert_close(payload, torch.full_like(payload, 0xF7), rtol=0, atol=0)
+        torch.testing.assert_close(scales, torch.full_like(scales, 127), rtol=0, atol=0)
+
+    def test_cpu_fp8_per_head_scales_and_nearest_even_ties(self):
+        x = torch.full((1, 2, 128), 448.0, dtype=torch.float16)
+        x[:, 1].mul_(0.5)
+        x[0, 0, :4] = torch.tensor([1.0625, 1.1875, -1.0625, -1.1875])
+        payload, scales = benchmark.quantize_fp8_cpu(x)
+        torch.testing.assert_close(scales, torch.tensor([[1.0, 0.5]]), rtol=0, atol=0)
+        torch.testing.assert_close(payload[0, 0, :4].float(), torch.tensor([1.0, 1.25, -1.0, -1.25]), rtol=0, atol=0)
+        self.assertEqual(payload.dtype, torch.float8_e4m3fn)
+        self.assertEqual(scales.dtype, torch.float32)
+        for tensor in (payload, scales):
+            self.assertEqual(tensor.device.type, "cpu")
+            self.assertTrue(tensor.is_contiguous())
+
+    def test_cpu_fp8_fixture_defines_exact_zero_rows(self):
+        x = torch.zeros((2, 1, 128), dtype=torch.float16)
+        payload, scales = benchmark.quantize_fp8_cpu(x)
+        # This fixture convention deliberately avoids DynamicQuant's 0/0 for
+        # all-zero rows; scale 1 and payload 0 are exact legal QLI inputs.
+        torch.testing.assert_close(scales, torch.ones((2, 1)), rtol=0, atol=0)
+        torch.testing.assert_close(payload.float(), x.float(), rtol=0, atol=0)
+
+    def test_cpu_quantizers_reject_wrong_shape_nonfinite_and_non_cpu(self):
+        for quantize in (benchmark.quantize_mxfp4_cpu, benchmark.quantize_fp8_cpu):
+            for x in (
+                torch.zeros(1, 1, 64, dtype=torch.float16),
+                torch.full((1, 1, 128), float("nan"), dtype=torch.float16),
+                torch.full((1, 1, 128), float("inf"), dtype=torch.float16),
+                torch.empty(1, 1, 128, dtype=torch.float16, device="meta"),
+            ):
+                with self.assertRaises(ValueError):
+                    quantize(x)
+
     def test_bf16_rounding_avoids_fp32_double_rounding_at_ties(self):
         values = torch.tensor([1 + 2**-8, 1 + 3 * 2**-8, 1 + 2**-8 + 2**-30, 2**-134, 3 * 2**-134], dtype=torch.float64)
         expected = torch.tensor([1.0, 1 + 2**-6, 1 + 2**-7, 0.0, 2**-132], dtype=torch.bfloat16)
@@ -164,6 +307,8 @@ class QLIBenchmarkTests(unittest.TestCase):
             report = json.loads(result.read_text())
             self.assertEqual(report["status"], "failed")
             self.assertEqual(report["error"]["type"], "AssertionError")
+            self.assertIn("Traceback (most recent call last)", report["error"]["traceback"])
+            self.assertIn("injected accuracy failure", report["error"]["traceback"])
 
     def test_runtime_errors_do_not_trigger_operator_build(self):
         for phase, api, status in (

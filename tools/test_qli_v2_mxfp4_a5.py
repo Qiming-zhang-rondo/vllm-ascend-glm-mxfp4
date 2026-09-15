@@ -4,7 +4,9 @@
 
 """Test the container's QLI V2 directly; do not import or install vLLM/VA.
 
-MXFP4 and FP8 use the same source tensors and the real CANN compute operator.
+MXFP4 and FP8 are prepared on CPU from the same source tensors, then consumed
+as real low-bit inputs by the CANN compute operator on A5. No NPU quantizer is
+part of this single-operator test.
 Decoded-payload correctness and error against the original input are reported
 separately. Timings include ACLNN preparation, dispatch and synchronization;
 they are not isolated kernel times or model-throughput measurements.
@@ -17,6 +19,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 # Directly running a file in tools/ otherwise puts tools/bisect before Python's
@@ -69,6 +72,7 @@ def parse_args(argv=None):
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--check-only", action="store_true", help="Run a small real MXFP4 compute smoke test only.")
+    parser.add_argument("--check-cache-layout", action="store_true", help="Also exercise padded, offset K cache views.")
     parser.add_argument("--opapi-lib", help="Existing library exporting both QLI V2 compute and metadata APIs")
     parser.add_argument("--acl-header", help="Container acl_base.h declaring FP4/E8M0 dtype enum values")
     parser.add_argument("--cann-root", help="Existing container CANN toolkit root")
@@ -183,8 +187,8 @@ def validate_indices(indices: torch.Tensor, query_tokens: int, key_tokens: int, 
 
 def accuracy_metrics(indices: torch.Tensor, values: torch.Tensor, scores: torch.Tensor) -> dict:
     """Require finite values explicitly: NaN must never silently pass a gate."""
-    actual_indices = indices[:, 0].cpu().long()
-    actual_values = values[:, 0].cpu().float()
+    actual_indices = indices.cpu()[:, 0].long()
+    actual_values = values.cpu()[:, 0].float()
     if actual_values.shape != actual_indices.shape:
         raise AssertionError("Indices and values must have the same shape")
     if bool((actual_indices < 0).any()):
@@ -239,32 +243,70 @@ def benchmark_compute(compute, warmup: int, iterations: int) -> dict[str, float]
     }
 
 
-def quantize_mxfp4(x: torch.Tensor, npu_ops) -> tuple[torch.Tensor, torch.Tensor]:
-    payload, scale = npu_ops.npu_dynamic_mx_quant(x.contiguous(), dst_type=npu_ops.float4_e2m1fn_x2, round_mode="round")
-    payload, scale = payload.view(torch.uint8), scale.view(torch.uint8)
-    if payload.shape != (*x.shape[:-1], HEAD_DIM // 2) or scale.shape != (*x.shape[:-1], 2, 2):
-        raise RuntimeError("Container DynamicMxQuant does not return the required FP4/E8M0 physical layout")
-    return payload, scale
-
-
-def prepare_case(name, quant_mode, q_source, k_source, npu_ops, backend, cu_q, seq_k, report=None):
+def report_stage(report, stage):
     if report is not None:
-        report["stage"] = f"{name}: input quantization and payload readback"
-        print("STAGE:", report["stage"], flush=True)
+        report["stage"] = stage
+        print("STAGE:", stage, flush=True)
+
+
+def quantization_input_cpu(x: torch.Tensor) -> torch.Tensor:
+    if x.device.type != "cpu" or x.shape[-1] != HEAD_DIM:
+        raise ValueError("Single-operator inputs must be CPU tensors with D128")
+    if x.dtype != torch.float16 or not bool(torch.isfinite(x).all()):
+        raise ValueError("Single-operator inputs must contain finite FP16 values")
+    return x.float()
+
+
+def quantize_mxfp4_cpu(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """D32 MX scale and E2M1 round-away encoding, using CPU tensor operations.
+
+    Follows ops-nn@2a77283 quant/dynamic_mx_quant/tests/assets/golden.py:
+    scale exponent = floor(log2(absmax)) - 2; round_mode='round'.
+    This prepares QLI inputs; it does not validate the NPU quantizer itself.
+    """
+    groups = quantization_input_cpu(x).reshape(*x.shape[:-1], 4, 32)
+    maxima = groups.abs().amax(dim=-1)
+    _, exponents = torch.frexp(maxima)
+    exponents = torch.where(maxima == 0, -127, exponents - 3).clamp(-127, 127)
+    normalized = groups / torch.ldexp(torch.ones_like(maxima), exponents).unsqueeze(-1)
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device="cpu")
+    # right=True chooses the larger magnitude at ties, and saturates at code 7.
+    codes = torch.bucketize(normalized.abs(), midpoints, right=True).to(torch.uint8)
+    codes |= normalized.signbit().to(torch.uint8) << 3
+    codes = codes.reshape(x.shape)
+    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    scales = (exponents + 127).to(torch.uint8).reshape(*x.shape[:-1], 2, 2)
+    return packed.contiguous(), scales.contiguous()
+
+
+def quantize_fp8_cpu(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row FP32 absmax/448 scale and E4M3FN RNE, as DynamicQuant mode 1."""
+    values = quantization_input_cpu(x)
+    scales = values.abs().amax(dim=-1) * (1.0 / 448.0)
+    # Define an exact zero row for this QLI fixture, avoiding 0/0 in the producer.
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+    payload = (values / scales.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return payload.contiguous(), scales.contiguous()
+
+
+def prepare_case(name, quant_mode, q_source, k_source, device, backend, cu_q, seq_k, report=None):
+    report_stage(report, f"{name}: CPU payload, scales and decoded reference")
     if quant_mode == QLI_MXFP4:
-        query, query_scale = quantize_mxfp4(q_source, npu_ops)
-        key, key_scale = quantize_mxfp4(k_source, npu_ops)
+        query, query_scale = quantize_mxfp4_cpu(q_source)
+        key, key_scale = quantize_mxfp4_cpu(k_source)
         key = key.reshape(-1, BLOCK_SIZE, 1, HEAD_DIM // 2)
         key_scale = key_scale.reshape(-1, BLOCK_SIZE, 1, 2, 2)
         decoded_q, decoded_k = decode_mxfp4(query, query_scale), decode_mxfp4(key, key_scale)
     else:
-        query, query_scale = npu_ops.npu_dynamic_quant(q_source.reshape(-1, HEAD_DIM), dst_type=torch.float8_e4m3fn)
-        key, key_scale = npu_ops.npu_dynamic_quant(k_source.reshape(-1, HEAD_DIM), dst_type=torch.float8_e4m3fn)
-        query = query.reshape_as(q_source)
-        query_scale = query_scale.float().reshape(q_source.shape[:-1])
+        query, query_scale = quantize_fp8_cpu(q_source)
+        key, key_scale = quantize_fp8_cpu(k_source)
         key = key.reshape(-1, BLOCK_SIZE, 1, HEAD_DIM)
-        key_scale = key_scale.float().reshape(-1, BLOCK_SIZE, 1)
+        key_scale = key_scale.reshape(-1, BLOCK_SIZE, 1)
         decoded_q, decoded_k = decode_fp8(query, query_scale), decode_fp8(key, key_scale)
+    host_key, host_scale = key, key_scale
+    report_stage(report, f"{name}: packed input H2D and synchronize")
+    query, key, query_scale, key_scale = (tensor.to(device) for tensor in (query, key, query_scale, key_scale))
+    torch.npu.synchronize()
     if report is not None:
         report["stage"] = f"{name}: QLI metadata"
         print("STAGE:", report["stage"], flush=True)
@@ -286,12 +328,15 @@ def prepare_case(name, quant_mode, q_source, k_source, npu_ops, backend, cu_q, s
         "quant_mode": quant_mode,
         "decoded_query": decoded_q,
         "decoded_key": decoded_k,
+        "host_key": host_key,
+        "host_key_scale": host_scale,
     }
 
 
 def check_case(case, invoke, args, original_scores, weights, result) -> dict:
     indices, values = invoke(return_value=1)
     torch.npu.synchronize()
+    indices, values = indices.cpu(), values.cpu()
     validate_indices(indices, args.query_tokens, args.key_tokens)
     if values.dtype != torch.bfloat16:
         raise AssertionError(f"Expected BF16 sparse values, got {values.dtype}")
@@ -315,19 +360,22 @@ def check_case(case, invoke, args, original_scores, weights, result) -> dict:
         }
     )
 
-    # Nonzero offset plus padded blocks exercises both ACL offset and stride.
-    key, scale = case["key"], case["key_scale"]
-    key_storage = torch.empty((key.shape[0] * 2 + 1, *key.shape[1:]), dtype=key.dtype, device=key.device)
-    scale_storage = torch.empty((scale.shape[0] * 2 + 1, *scale.shape[1:]), dtype=scale.dtype, device=scale.device)
-    strided_key, strided_scale = key_storage[1::2], scale_storage[1::2]
-    strided_key.copy_(key)
-    strided_scale.copy_(scale)
-    strided_indices, strided_values = invoke(key=strided_key, key_scale=strided_scale, return_value=1)
-    torch.npu.synchronize()
-    validate_indices(strided_indices, args.query_tokens, args.key_tokens)
-    # The compute op is deterministic: no dependence on physical block position.
-    torch.testing.assert_close(strided_indices.cpu(), indices.cpu(), rtol=0, atol=0)
-    torch.testing.assert_close(strided_values.cpu(), values.cpu(), rtol=0, atol=0)
+    if args.check_cache_layout:
+        # Optional cache coverage, with backing storage prepared on CPU.
+        key, scale = case["host_key"], case["host_key_scale"]
+        key_storage = torch.zeros((key.shape[0] * 2 + 1, *key.shape[1:]), dtype=key.dtype, device="cpu")
+        scale_storage = torch.zeros((scale.shape[0] * 2 + 1, *scale.shape[1:]), dtype=scale.dtype, device="cpu")
+        key_storage[1::2].copy_(key)
+        scale_storage[1::2].copy_(scale)
+        strided_key = key_storage.to(case["key"].device)[1::2]
+        strided_scale = scale_storage.to(case["key_scale"].device)[1::2]
+        strided_indices, strided_values = invoke(key=strided_key, key_scale=strided_scale, return_value=1)
+        torch.npu.synchronize()
+        torch.testing.assert_close(strided_indices.cpu(), indices, rtol=0, atol=0)
+        torch.testing.assert_close(strided_values.cpu(), values, rtol=0, atol=0)
+        result["dense_vs_strided_exact"] = True
+    else:
+        result["cache_layout_check"] = "not requested"
     index_only, empty_values = invoke(return_value=0)
     torch.npu.synchronize()
     torch.testing.assert_close(index_only.cpu(), indices.cpu(), rtol=0, atol=0)
@@ -335,7 +383,6 @@ def check_case(case, invoke, args, original_scores, weights, result) -> dict:
         raise AssertionError("return_value=0 must return empty sparse values")
     result.update(
         {
-            "dense_vs_strided_exact": True,
             "indices_only_vs_return_values_exact": True,
             "passed": decoded_passed and quantization_passed,
         }
@@ -350,14 +397,14 @@ def smoke_test(backend, npu_ops, device, quant_mode=QLI_MXFP4, report=None):
         report["stage"] = "smoke: CPU input preparation and copy to NPU"
         print("STAGE:", report["stage"], flush=True)
     generator = torch.Generator(device="cpu").manual_seed(20260911)
-    query_source = torch.randn(1, 64, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator).to(device)
-    key_source = torch.randn(TOPK, 1, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator).to(device)
+    query_source = torch.randn(1, 64, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator)
+    key_source = torch.randn(TOPK, 1, HEAD_DIM, dtype=torch.float16, device="cpu", generator=generator)
     cu_q = torch.tensor([0, 1], dtype=torch.int32, device="cpu").to(device)
     seq_k = torch.tensor([TOPK], dtype=torch.int32, device="cpu").to(device)
     weights = torch.ones((1, 64), dtype=torch.float32, device="cpu").to(device)
     blocks = torch.arange(TOPK // BLOCK_SIZE, dtype=torch.int32, device="cpu").view(1, -1).to(device)
     torch.npu.synchronize()
-    case = prepare_case("QLI smoke", quant_mode, query_source, key_source, npu_ops, backend, cu_q, seq_k, report)
+    case = prepare_case("QLI smoke", quant_mode, query_source, key_source, device, backend, cu_q, seq_k, report)
     if report is not None:
         report["stage"] = "smoke: QLI compute"
         print("STAGE:", report["stage"], flush=True)
@@ -444,9 +491,7 @@ def run(args, report):
         raise ContainerPrerequisiteError(f"Cannot initialize the container NPU: {error}") from error
     if soc != 260:
         raise ContainerPrerequisiteError(f"Real MXFP4 QLI requires A5 (runtime SOC 260); got {soc}, {device_name}")
-    required = ["npu_dynamic_mx_quant", "float4_e2m1fn_x2", "get_npu_format"]
-    if not args.check_only:
-        required.append("npu_dynamic_quant")
+    required = ["get_npu_format"]
     missing = [name for name in required if not hasattr(torch_npu, name)]
     if not args.check_only and not hasattr(torch, "float8_e4m3fn"):
         missing.append("torch.float8_e4m3fn")
@@ -467,8 +512,16 @@ def run(args, report):
     except (RuntimeError, ValueError) as error:
         raise ContainerPrerequisiteError(str(error)) from error
     report["backend"] = backend.describe()
+    report["input_preparation"] = {
+        "device": "CPU",
+        "mxfp4": "D32 E8M0 floor(log2(absmax))-2 scale, E2M1 round-away, low-nibble first",
+        "fp8": "per-row FP32 absmax/448 scale, E4M3FN RNE",
+        "scope": "QLI compute test; does not validate or time NPU quantization operators",
+        "reference": "CANN ops-nn@2a77283 tests/assets/golden.py for dynamic_mx_quant and dynamic_quant",
+    }
     print("CONTAINER:", json.dumps(report["environment"], default=str), flush=True)
     print("BACKEND:", json.dumps(report["backend"], default=str), flush=True)
+    print("INPUT_PREPARATION: CPU packed payload/scales; A5 executes real QLI Metadata and compute", flush=True)
     if args.check_only:
         run_smoke(backend, torch_npu, torch.device("npu", args.device), report, QLICallError)
         report["backend"]["mxfp4_compute_verified"] = True
@@ -483,7 +536,7 @@ def run(args, report):
     print("CPU_INPUT_READY: synthetic inputs and FP32 reference prepared on CPU", flush=True)
     report["stage"] = "input copy to NPU"
     device = torch.device("npu", args.device)
-    query_source, key_source, weights = (tensor.to(device) for tensor in (query_host, key_host, weights_host))
+    weights = weights_host.to(device)
     cu_q = torch.tensor([0, args.query_tokens], dtype=torch.int32, device="cpu").to(device)
     seq_k = torch.tensor([args.key_tokens], dtype=torch.int32, device="cpu").to(device)
     blocks = torch.arange(args.key_tokens // BLOCK_SIZE, dtype=torch.int32, device="cpu").view(1, -1).to(device)
@@ -493,8 +546,8 @@ def run(args, report):
     report["timing_scope"] = "Synchronous wall latency including Python/ACLNN preparation, workspace, dispatch and sync"
     print("TIMING:", report["timing_scope"], "; quantization and metadata excluded", flush=True)
     for name, quant_mode in (("MXFP4", QLI_MXFP4), ("FP8", QLI_FP8)):
-        report["stage"] = f"{name} quantization and metadata"
-        case = prepare_case(name, quant_mode, query_source, key_source, torch_npu, backend, cu_q, seq_k, report)
+        report["stage"] = f"{name} CPU input preparation and metadata"
+        case = prepare_case(name, quant_mode, query_host, key_host, device, backend, cu_q, seq_k, report)
         print(f"{name}_QUANT_READY: payload, scales and metadata prepared", flush=True)
 
         def invoke(*, key=None, key_scale=None, return_value=0, case=case, quant_mode=quant_mode):
@@ -549,7 +602,7 @@ def main(argv=None) -> int:
         return_code = 0
     except Exception as error:
         report["status"] = "failed"
-        report["error"] = {"type": type(error).__name__, "message": str(error)}
+        report["error"] = {"type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()}
         print(f"QLI test FAILED: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         if isinstance(error, ExistingOperatorUnavailable):
             return_code = 78
