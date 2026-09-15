@@ -13,6 +13,17 @@ import sys
 from pathlib import Path
 
 DEFAULT_CASES = "MXFP4_PA_20,MXFP4_META_70_002"
+PERF_CASES = DEFAULT_CASES + ",FP8_PA_04,FP8_META_70_002"
+
+PERF_BOOTSTRAP = r"""
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('qli_official_perf_plugin', sys.argv[1])
+plugin = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = plugin
+spec.loader.exec_module(plugin)
+import pytest
+sys.exit(pytest.main(sys.argv[2:], plugins=[plugin]))
+"""
 
 PREFLIGHT = r"""
 import importlib, json, sys
@@ -38,6 +49,11 @@ if not errors:
                 errors.append(f'Official bridge did not register {name}')
     except Exception as error:
         errors.append(f'Official bridge import: {error}')
+if not errors and '--perf' in sys.argv:
+    import torch_npu
+    for name in ('profile', 'tensorboard_trace_handler', '_ExperimentalConfig', 'ProfilerLevel', 'ExportType'):
+        if not hasattr(torch_npu.profiler, name):
+            errors.append(f'Performance collection requires existing torch_npu.profiler.{name}')
 print(json.dumps({'modules': modules, 'errors': errors}, indent=2), flush=True)
 sys.exit(2 if errors else 0)
 """
@@ -45,8 +61,18 @@ sys.exit(2 if errors else 0)
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cases", default=DEFAULT_CASES)
+    parser.add_argument(
+        "--cases", help="Official STC case names; --perf defaults to the C4 cases plus matching FP8 cases"
+    )
+    parser.add_argument(
+        "--perf", action="store_true", help="After each official accuracy check, collect QLI device-task timings"
+    )
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=20)
     args = parser.parse_args(argv)
+    if args.warmup < 1 or args.iters < 1:
+        parser.error("--warmup and --iters must be positive")
+    args.cases = args.cases or (PERF_CASES if args.perf else DEFAULT_CASES)
     repo = Path(__file__).resolve().parents[1]
     source = repo / "tools/vendor/cann_qli_v2"
     manifest_path = repo / ".qli-op-build/install.json"
@@ -70,9 +96,9 @@ def main(argv=None):
             "ASCEND_OPP_PATH": str(cann / "opp"),
             "ASCEND_CUSTOM_OPP_PATH": str(vendor),
             "ASCEND_PROCESS_LOG_PATH": str(plog_dir),
-            "ASCEND_GLOBAL_LOG_LEVEL": "0",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3" if args.perf else "0",
             "ASCEND_SLOG_PRINT_TO_STDOUT": "0",
-            "ASCEND_LAUNCH_BLOCKING": "1",
+            "ASCEND_LAUNCH_BLOCKING": "0" if args.perf else "1",
             "TORCH_EXTENSIONS_DIR": str(repo / ".qli-official/torch_extensions"),
             "MAX_JOBS": environment.get("MAX_JOBS", "2"),
             "PYTHONPATH": os.pathsep.join([str(source), environment.get("PYTHONPATH", "")]).rstrip(os.pathsep),
@@ -88,6 +114,18 @@ def main(argv=None):
     environment["LD_LIBRARY_PATH"] = os.pathsep.join(
         [str(opapi.parent), str(cann / "lib64"), environment.get("LD_LIBRARY_PATH", "")]
     ).rstrip(os.pathsep)
+    if args.perf:
+        profiler_paths = (cann / "tools/profiler/bin/msprof", cann / "toolkit/tools/profiler/bin/msprof")
+        msprof = next(
+            (str(path) for path in profiler_paths if path.is_file() and os.access(path, os.X_OK)),
+            shutil.which("msprof"),
+        )
+        if not msprof:
+            parser.error("--perf requires the container's CANN msprof export tool; no dependencies were installed")
+        environment["PATH"] = os.pathsep.join([str(Path(msprof).parent), environment.get("PATH", "")]).rstrip(
+            os.pathsep
+        )
+        print("Reuse CANN profiler:", msprof, flush=True)
     print("Official CANN cases:", args.cases, flush=True)
     print("Reuse NPU operator:", opapi, flush=True)
     print(
@@ -95,7 +133,11 @@ def main(argv=None):
         flush=True,
     )
     checked = subprocess.run(
-        [sys.executable, "-c", PREFLIGHT], cwd=source, env=environment, capture_output=True, text=True
+        [sys.executable, "-c", PREFLIGHT] + (["--perf"] if args.perf else []),
+        cwd=source,
+        env=environment,
+        capture_output=True,
+        text=True,
     )
     (run_dir / "preflight.log").write_text(checked.stdout + checked.stderr)
     print(checked.stdout + checked.stderr, end="", flush=True)
@@ -117,6 +159,23 @@ def main(argv=None):
         "ci",
         str(test_dir / "test_quant_lightning_indexer_v2_single.py"),
     ]
+    if args.perf:
+        command = (
+            [sys.executable, "-c", PERF_BOOTSTRAP, str(repo / "tools/qli_official_perf_plugin.py")]
+            + command[3:]
+            + [
+                "--qli-perf-output",
+                str(run_dir / "performance.json"),
+                "--qli-perf-warmup",
+                str(args.warmup),
+                "--qli-perf-iters",
+                str(args.iters),
+            ]
+        )
+        print(
+            "Performance: official accuracy first, then warmed QLI device-task duration from CANN profiler (us).",
+            flush=True,
+        )
     log = run_dir / "official.log"
     print("Run output:", log, flush=True)
     with log.open("w") as stream:

@@ -1,5 +1,14 @@
 # vLLM Ascend Development Guidelines
 
+## User requirements for standalone operator validation
+
+- Start with upstream operator accuracy cases, their original golden and official calling bridge. Establish a passing run before adding benchmarks or model-specific shapes.
+- Reuse the container's installed CANN, torch and torch_npu. Do not install dependencies or operate containers/images for these tests unless explicitly requested.
+- Keep execution to one update-and-run command. Do not introduce a custom ctypes binding, dtype-header parser or replacement golden when the official test path is available.
+- After accuracy passes, benchmark the same prepared inputs and official compute call. Exclude input generation, transfers, quantization, metadata, JIT and warmup from measured samples.
+- Distinguish official operator correctness, quantization loss against original inputs, and model accuracy. Name the timing scope precisely; CANN Task Duration is a device-task measurement, not Python wall time.
+- Preserve per-run logs and plog. Do not claim A5 verification from CPU-only tests or loosen accuracy thresholds to obtain a pass.
+
 This document provides instructions for contributors to the vLLM Ascend project. Please read and follow these guidelines to ensure code quality, maintainability, and consistency.
 
 ---

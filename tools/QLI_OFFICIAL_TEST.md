@@ -1,4 +1,4 @@
-# A5：运行 CANN 官方 QLI V2 MXFP4 精度用例
+# A5：运行 CANN 官方 QLI V2 MXFP4 精度和性能测试
 
 已有私有 QLI 算子包（`.qli-op-build/install.json`）的容器中执行：
 
@@ -20,9 +20,36 @@ git -C /workspace/vllm-ascend-glm-mxfp4-optest pull --ff-only && python3 /worksp
 | `MXFP4_PA_20` | TND + 分页 K，Q=1、K=128、H=1、D=128、TopK=64 |
 | `MXFP4_META_70_002` | BSND，Q=4、K=641、H=64、D=128、TopK=64，检查 indices 和 scores |
 
-这是官方精度检查，不提供性能基线，也不验证 GLM 端到端精度。
-为定位错误，子进程启用详细 plog 和同步执行；这些设置不影响容器外部的进程。
-本地已检查调用流程、用例选择及日志隔离；实际 C++ 编译和算子执行仍需 A5 验证。
+不加 `--perf` 时仅检查官方精度，子进程启用详细 plog 和同步执行。
+用户已在 A5 报告官方精度用例 `PASSED`；新增性能采集尚待 A5 实测。
+
+## 同时测精度和性能
+
+```bash
+git -C /workspace/vllm-ascend-glm-mxfp4-optest pull --ff-only && python3 /workspace/vllm-ascend-glm-mxfp4-optest/tools/run_qli_official_a5.py --perf
+```
+
+默认增加相同 shape 的 `FP8_PA_04` 和 `FP8_META_70_002`，共四个官方用例。
+每个用例先执行完整官方精度检查，通过后复用该次实际输入、metadata 和原始 C++ 调用，
+预热 5 次，再用容器已有的 `torch_npu.profiler` 采集 20 次计算。
+profiler 导出使用容器已有的 CANN `msprof`；入口会查找现有安装路径，不会下载或安装。
+用 `--warmup N --iters N` 调整次数，用 `--cases` 选择官方 STC 用例。
+官方用例、golden、比较阈值和 C++ bridge 均未因性能功能而修改。
+
+终端打印每个用例的 p50、p90、平均耗时（微秒），以及两组 FP8/C4 的 p50 比值。
+比值大于 1 表示该 shape 下 C4 的设备任务耗时更短。
+完整数据保存在本次目录的 `performance.json`，原始 CSV 在 `profiler/<用例>/`。
+
+统计值取自 CANN `op_summary*.csv` 的 QLI compute `Task Duration(us)`。
+这是 profiler 下的设备任务耗时，包含设备任务调度、执行和完成响应，不能称为纯指令执行时间。
+输入生成、H2D、量化、metadata、首次 JIT、精度比较、预热及 CPU 提交间隔不计入这个字段。
+性能子进程关闭 `ASCEND_LAUNCH_BLOCKING` 和详细调试日志，退出不改变容器原有环境。
+采样为空、异常或数量不符时，保留 trace 并报错，不输出伪造的性能值。
+
+两种量化模式使用相同 shape、各自的官方合成数据。这不衡量 C4 相对原始高精度输入的量化损失，
+也不验证 GLM 端到端精度；上述小 shape 的性能不能直接代表 GLM 生产负载。
+
+## 输出和诊断
 
 每次输出保存在 `.qli-official/<时间>/`：
 

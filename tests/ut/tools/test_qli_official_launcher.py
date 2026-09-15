@@ -109,6 +109,20 @@ class TestOfficialLauncher(unittest.TestCase):
         self.assertFalse((run_dir / "official.log").exists())
         self.assertFalse((run_dir / "run.json").exists())
 
+    def test_performance_uses_official_cases_and_disables_debug_synchronization(self):
+        self.assertEqual(launcher.main(["--perf", "--warmup", "3", "--iters", "7"]), 0)
+        environment = self.popen.call_args.kwargs["env"]
+        self.assertEqual(environment["ASCEND_LAUNCH_BLOCKING"], "0")
+        self.assertEqual(environment["ASCEND_GLOBAL_LOG_LEVEL"], "3")
+        self.assertEqual(environment["QLIV2_CASE_NAMES"], launcher.PERF_CASES)
+        command = self.popen.call_args.args[0]
+        self.assertEqual(command[:2], [launcher.sys.executable, "-c"])
+        self.assertEqual(command[3], str(self.repo / "tools/qli_official_perf_plugin.py"))
+        self.assertIn(str(self.test_dir / "test_quant_lightning_indexer_v2_single.py"), command)
+        self.assertEqual(command[command.index("--qli-perf-warmup") + 1], "3")
+        self.assertEqual(command[command.index("--qli-perf-iters") + 1], "7")
+        self.assertIn("--perf", self.run.call_args.args[0])
+
     def test_pytest_failure_preserves_status_and_collects_exact_run(self):
         self.process.wait.return_value = 7
         self.run.side_effect = [
