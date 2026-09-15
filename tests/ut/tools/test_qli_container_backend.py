@@ -24,7 +24,7 @@ typedef enum {
     ACL_FLOAT8_E4M3FN, ACL_FLOAT8_E8M0 = 0xB1U,
     ACL_FLOAT4_E2M1 = (ACL_FLOAT8_E8M0 + 4)
 } aclDataType;
-typedef enum { ACL_FORMAT_NCHW = 0, ACL_FORMAT_ND = 2 } aclFormat;
+typedef enum { ACL_FORMAT_NCHW = 0, ACL_FORMAT_NHWC = 1, ACL_FORMAT_ND = 2, ACL_FORMAT_NCDHW = 30 } aclFormat;
 """
 
 
@@ -263,6 +263,36 @@ class EnumAndLayoutTests(unittest.TestCase):
 
 
 class AclCallTests(unittest.TestCase):
+    def test_five_dimensional_ncdhw_scale_cache_preserves_logical_nd_view(self):
+        harness = Harness()
+        backend = harness.make_backend()
+        harness.torch_npu.get_npu_format = lambda tensor: backend.enums["ACL_FORMAT_NCDHW"] if tensor.ndim == 5 else 2
+        inputs = harness.inputs()
+        inputs["key_scale"]._offset = 4
+        backend.invoke(**inputs)
+        scale = harness.descriptors[harness.workspace_arguments[4]]
+        self.assertEqual(scale["format"], backend.enums["ACL_FORMAT_ND"])
+        self.assertEqual(scale["shape"], inputs["key_scale"].shape)
+        self.assertEqual(scale["strides"], inputs["key_scale"].stride())
+        self.assertEqual(scale["offset"], 4)
+        self.assertEqual(scale["data"], 0x100000)
+
+    def test_nhwc_base_storage_is_accepted_without_repacking(self):
+        harness = Harness()
+        backend = harness.make_backend()
+        harness.torch_npu.get_npu_format = lambda tensor: backend.enums["ACL_FORMAT_NHWC"]
+        backend.invoke(**harness.inputs())
+        self.assertIn("execute", harness.events)
+        self.assertTrue(all(item["format"] == backend.enums["ACL_FORMAT_ND"] for item in harness.descriptors.values()))
+
+    def test_opaque_storage_is_rejected_with_tensor_details(self):
+        harness = Harness()
+        backend = harness.make_backend()
+        harness.torch_npu.get_npu_format = lambda tensor: 29
+        with self.assertRaisesRegex(ValueError, r"format=29, shape=\(1, 32, 64\), dtype=uint8"):
+            backend.invoke(**harness.inputs())
+        self.assertEqual(harness.events, [])
+
     def test_fp8_uses_mode_one_e4m3_and_fp32_scales(self):
         harness = Harness()
         backend = harness.make_backend()

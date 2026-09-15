@@ -347,11 +347,21 @@ class QLIBackend:
         get_format = getattr(self.torch_npu, "get_npu_format", None)
         if get_format is None:
             raise RuntimeError("torch_npu.get_npu_format is required to verify base-format tensor storage")
-        allowed_formats = [self.enums["ACL_FORMAT_ND"]]
-        if "ACL_FORMAT_NCHW" in self.enums:
-            allowed_formats.append(self.enums["ACL_FORMAT_NCHW"])
-        if get_format(tensor) not in allowed_formats:
-            raise ValueError("QLI benchmark supports only base-format NPU storage, not opaque NZ/FRACTAL storage")
+        # Match IsOpInputBaseFormat and the QLIV2TensorWrapper C++ adapter:
+        # these base formats all use logical shape/stride/offset with ACL ND.
+        # In particular, a newly allocated 5-D scale cache may be NCDHW.
+        allowed_formats = {
+            self.enums[name]
+            for name in ("ACL_FORMAT_ND", "ACL_FORMAT_NCHW", "ACL_FORMAT_NHWC", "ACL_FORMAT_NCDHW")
+            if name in self.enums
+        }
+        storage_format = get_format(tensor)
+        if storage_format not in allowed_formats:
+            raise ValueError(
+                f"QLI benchmark rejects opaque NPU storage: format={storage_format}, "
+                f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}; "
+                f"supported base-format IDs={sorted(allowed_formats)}"
+            )
         dtype_name = dtype_name or self._dtype_name(tensor)
         shape, strides = list(tensor.shape), list(tensor.stride())
         offset = tensor.storage_offset()
