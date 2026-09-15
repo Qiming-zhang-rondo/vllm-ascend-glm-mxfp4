@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "repository": "https://gitcode.com/cann/ops-transformer",
+  "ref": "55498d91634277d4eec912499c027818a8c167fb",
+  "scope": "Unmodified upstream QLI V2 Torch host binding and registration; no ctypes backend, setup.py, dependency installation, or NPU kernel build.",
+  "files": [
+    {
+      "path": "LICENSE",
+      "upstream_path": "LICENSE",
+      "sha256": "89b1c114df62cfd183004f38d18d07f186436c3b37203dd69c3e84becf9d2282"
+    },
+    {
+      "path": "cann_ops_transformer/op_builder/builder.py",
+      "upstream_path": "torch_extension/cann_ops_transformer/op_builder/builder.py",
+      "sha256": "7f2d162f6ee96ff782376e0df82f036fac74150003f2c15fdb3fc1b79311c8cd"
+    },
+    {
+      "path": "cann_ops_transformer/op_builder/__init__.py",
+      "upstream_path": "torch_extension/cann_ops_transformer/op_builder/__init__.py",
+      "sha256": "4ad7d26eebb562fc480bd64786c4874de470cd7f696ff1a49ebdef60d510eced"
+    },
+    {
+      "path": "cann_ops_transformer/common/aclnn_common.h",
+      "upstream_path": "torch_extension/cann_ops_transformer/common/aclnn_common.h",
+      "sha256": "61f638958922cab6c8227cccc071b9df3e44e2426357d29eca23f043fbf92df1"
+    },
+    {
+      "path": "cann_ops_transformer/csrc/attention/quant_lightning_indexer.cpp",
+      "upstream_path": "attention/quant_lightning_indexer_v2/torch_extension/csrc/quant_lightning_indexer.cpp",
+      "sha256": "9fa71ff86f2e0a4191a8bbc7352636e59f178394694172dda16437c1e2199970"
+    },
+    {
+      "path": "cann_ops_transformer/quant_lightning_indexer.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/torch_extension/quant_lightning_indexer.py",
+      "sha256": "1a960a14485c9f954a6df40d552a9908f219633096b10b68566245f92ff41c6d"
+    }
+  ],
+  "local_package_files": [
+    {
+      "path": "cann_ops_transformer/__init__.py",
+      "purpose": "Import only the upstream QLI V2 registration module.",
+      "sha256": "3df610fae3302d71e928e3fc08d92a2e16bc895ccdccb6cd62ecd0d40d39bebb"
+    }
+  ],
+  "runtime": {
+    "pythonpath": "tools/vendor/cann_qli_v2",
+    "jit_sources": [
+      "cann_ops_transformer/csrc/attention/quant_lightning_indexer.cpp"
+    ],
+    "jit_trigger": "First upstream compute or metadata invocation calls OpBuilder.load().",
+    "existing_dependencies": [
+      "torch",
+      "torch_npu",
+      "ninja",
+      "C++ compiler",
+      "CANN headers and runtime libraries"
+    ],
+    "operator_package": "Official aclnn_common.h resolves existing custom op_api libraries from ASCEND_CUSTOM_OPP_PATH before built-in libraries.",
+    "cann_root": "Official OpBuilder uses ASCEND_HOME_PATH when it names an existing directory; otherwise it falls back relative to torch_npu."
+  }
+}

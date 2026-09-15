@@ -242,3 +242,5 @@ csrc/third_party/
 .qli-op-build/
 qli_a5_*.log
 qli_a5_*.json
+.qli-official/
+qli_timeout_diagnostic.json

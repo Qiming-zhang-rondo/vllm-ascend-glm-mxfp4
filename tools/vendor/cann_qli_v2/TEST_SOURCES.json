@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "repository": "https://gitcode.com/cann/ops-transformer",
+  "ref": "55498d91634277d4eec912499c027818a8c167fb",
+  "upstream_directory": "attention/quant_lightning_indexer_v2/tests/pytest",
+  "description": "Original CANN QLI V2 pytest cases, input generation, golden, and accuracy comparison. No case, input, golden, or comparison changes.",
+  "compatibility_changes": [
+    {
+      "path": "pytest/quant_lightning_indexer_v2_golden.py",
+      "change": "Remove the unused `import test` statement, which otherwise requires the optional CPython standard-library test package in minimal containers.",
+      "original_line": 13
+    }
+  ],
+  "files": [
+    {
+      "path": "pytest/README.md",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/README.md",
+      "upstream_sha256": "7fbd3249a5029b4390c3e4b86ff48aaca2c15e2bdb16797a6bbcd4251dd5c477",
+      "sha256": "7fbd3249a5029b4390c3e4b86ff48aaca2c15e2bdb16797a6bbcd4251dd5c477",
+      "modifications": []
+    },
+    {
+      "path": "pytest/batch/list_pt_from_excel.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/batch/list_pt_from_excel.py",
+      "upstream_sha256": "3b82fb6be7241b387cbe11a9eb935540b49b89d4857e7ad4edffafe5971a4206",
+      "sha256": "3b82fb6be7241b387cbe11a9eb935540b49b89d4857e7ad4edffafe5971a4206",
+      "modifications": []
+    },
+    {
+      "path": "pytest/batch/quant_lightning_indexer_v2_pt_loadprocess.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/batch/quant_lightning_indexer_v2_pt_loadprocess.py",
+      "upstream_sha256": "6760b07a99f9b39f6938e0e398d8064260cb18fee75f4921a392e7dc541a903c",
+      "sha256": "6760b07a99f9b39f6938e0e398d8064260cb18fee75f4921a392e7dc541a903c",
+      "modifications": []
+    },
+    {
+      "path": "pytest/batch/quant_lightning_indexer_v2_pt_save.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/batch/quant_lightning_indexer_v2_pt_save.py",
+      "upstream_sha256": "6884364e4b126de20f65da62bf02ac4cf0c0ff6c9feebbc99ca3149afb848559",
+      "sha256": "6884364e4b126de20f65da62bf02ac4cf0c0ff6c9feebbc99ca3149afb848559",
+      "modifications": []
+    },
+    {
+      "path": "pytest/batch/replace_path.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/batch/replace_path.py",
+      "upstream_sha256": "58b12c94033a0b3840714663326fce192b224ed27dc3e583c334954750376455",
+      "sha256": "58b12c94033a0b3840714663326fce192b224ed27dc3e583c334954750376455",
+      "modifications": []
+    },
+    {
+      "path": "pytest/batch_isolated_run.sh",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/batch_isolated_run.sh",
+      "upstream_sha256": "accede2ecaa6c2bc178c5be41f67e172ff89165eee26c50b2646c3ca4eb07b7a",
+      "sha256": "accede2ecaa6c2bc178c5be41f67e172ff89165eee26c50b2646c3ca4eb07b7a",
+      "modifications": []
+    },
+    {
+      "path": "pytest/collect_perf_data.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/collect_perf_data.py",
+      "upstream_sha256": "ec2448d29a24ef0b29b942f2c61fc7204ba3d0374065b99cbc2db11863b925dd",
+      "sha256": "ec2448d29a24ef0b29b942f2c61fc7204ba3d0374065b99cbc2db11863b925dd",
+      "modifications": []
+    },
+    {
+      "path": "pytest/pytest.ini",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/pytest.ini",
+      "upstream_sha256": "dc4eaddb80bcdc9d4633f954647361a3cc16d117565dc2bad2c2ab2aa2e2433c",
+      "sha256": "dc4eaddb80bcdc9d4633f954647361a3cc16d117565dc2bad2c2ab2aa2e2433c",
+      "modifications": []
+    },
+    {
+      "path": "pytest/qliv2_parameter_normalization.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/qliv2_parameter_normalization.py",
+      "upstream_sha256": "18f6ba96212ee3e191b9145b06b909dad762023277ca50194a32912f7a8f9706",
+      "sha256": "18f6ba96212ee3e191b9145b06b909dad762023277ca50194a32912f7a8f9706",
+      "modifications": []
+    },
+    {
+      "path": "pytest/qliv2_test_utils.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/qliv2_test_utils.py",
+      "upstream_sha256": "b61ba57972a18d029b310df67679cdc4e9ebbdce81e176a2aaba277b4ada7f86",
+      "sha256": "b61ba57972a18d029b310df67679cdc4e9ebbdce81e176a2aaba277b4ada7f86",
+      "modifications": []
+    },
+    {
+      "path": "pytest/quant_lightning_indexer_v2_acl_graph.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/quant_lightning_indexer_v2_acl_graph.py",
+      "upstream_sha256": "633a9c963c6c86079436794c00950b9de6c32827b60e5b238eff3b0bb05b107a",
+      "sha256": "633a9c963c6c86079436794c00950b9de6c32827b60e5b238eff3b0bb05b107a",
+      "modifications": []
+    },
+    {
+      "path": "pytest/quant_lightning_indexer_v2_golden.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/quant_lightning_indexer_v2_golden.py",
+      "upstream_sha256": "8cda0c87cc2da6e78b8ad5111df2b68c1b5401e2520088a008e4f02065ddc36e",
+      "sha256": "10d72996f26566bb95c6a777225a6e67d099a9a22329a6ffaa239da10ef98156",
+      "modifications": [
+        "Remove unused import test."
+      ]
+    },
+    {
+      "path": "pytest/result_compare_method.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/result_compare_method.py",
+      "upstream_sha256": "ef7985d5ec6919a1f523d565047acf8f6d4a8006d1873715e5be6c1a69a382f4",
+      "sha256": "ef7985d5ec6919a1f523d565047acf8f6d4a8006d1873715e5be6c1a69a382f4",
+      "modifications": []
+    },
+    {
+      "path": "pytest/test_qliv2_test_utils.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/test_qliv2_test_utils.py",
+      "upstream_sha256": "dcd22496b28b10feaea88120ba84079cd81434db714749562ae884d8131dd714",
+      "sha256": "dcd22496b28b10feaea88120ba84079cd81434db714749562ae884d8131dd714",
+      "modifications": []
+    },
+    {
+      "path": "pytest/test_quant_lightning_indexer_v2_batch.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_batch.py",
+      "upstream_sha256": "2c3efc481c6e5df3e199c6ef7963fd6bf8bca5f17cc41d77c32334d5c2434c35",
+      "sha256": "2c3efc481c6e5df3e199c6ef7963fd6bf8bca5f17cc41d77c32334d5c2434c35",
+      "modifications": []
+    },
+    {
+      "path": "pytest/test_quant_lightning_indexer_v2_paramset.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_paramset.py",
+      "upstream_sha256": "cd95451d66439b5419901cfe0b3fd81439391b699643cccfb2ae617591ca68b5",
+      "sha256": "cd95451d66439b5419901cfe0b3fd81439391b699643cccfb2ae617591ca68b5",
+      "modifications": []
+    },
+    {
+      "path": "pytest/test_quant_lightning_indexer_v2_single.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_single.py",
+      "upstream_sha256": "d6f083a2136dbe7235c839b324f452da2faa0902afa0514889308e5d25152c91",
+      "sha256": "d6f083a2136dbe7235c839b324f452da2faa0902afa0514889308e5d25152c91",
+      "modifications": []
+    },
+    {
+      "path": "pytest/test_quant_lightning_indexer_v2_stc.py",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_stc.py",
+      "upstream_sha256": "0de7b6d256c87aeef8abfe5e0f9904beab13304730634282e75d6b7c1fb769c7",
+      "sha256": "0de7b6d256c87aeef8abfe5e0f9904beab13304730634282e75d6b7c1fb769c7",
+      "modifications": []
+    },
+    {
+      "path": "pytest/test_run.sh",
+      "upstream_path": "attention/quant_lightning_indexer_v2/tests/pytest/test_run.sh",
+      "upstream_sha256": "2ce6c2e204c4e302b4ccb9f3124bedcf08a3f785e3dc1f3aed250751cf63a0cb",
+      "sha256": "2ce6c2e204c4e302b4ccb9f3124bedcf08a3f785e3dc1f3aed250751cf63a0cb",
+      "modifications": []
+    }
+  ]
+}
