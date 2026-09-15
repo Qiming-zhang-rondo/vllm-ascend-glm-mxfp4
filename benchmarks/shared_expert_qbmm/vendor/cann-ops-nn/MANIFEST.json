@@ -1,0 +1,74 @@
+{
+  "repository": "https://gitcode.com/cann/ops-nn.git",
+  "commit": "2a77283db46e6648ff47bc8277442cf9c721e3c2",
+  "files_are_unmodified": true,
+  "license": "CANN Open Software License Agreement Version 2.0",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/LICENSE"
+    },
+    {
+      "path": "matmul/common/tests/st/arch35/matmul_golden_util.py",
+      "sha256": "1dcdcf96594f1f0ffb869379d59dde3d736a4bf85493814f94325f62f2faec7b",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/common/tests/st/arch35/matmul_golden_util.py"
+    },
+    {
+      "path": "matmul/common/tests/st/arch35/matmul_quant_util.py",
+      "sha256": "5a31668830f56ea8a7c9e500bb4425b1dd0b7ac67e0ebce019e144a7f8effe4d",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/common/tests/st/arch35/matmul_quant_util.py"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v3/tests/assets/qbmmv3_kernel_golden.py",
+      "sha256": "6f26df967e23dda37dcd78e0aa04a7b04d566c9faf1cd5df0b2bb5f91cf9f07d",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v3/tests/assets/qbmmv3_kernel_golden.py"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v3/tests/assets/qbmmv3_aclnn_golden.py",
+      "sha256": "20a5866ee369c5423a3059ad544c8450f81baf2ed0e44f9bb6a2a6226dc9e0e7",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v3/tests/assets/qbmmv3_aclnn_golden.py"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v3/tests/assets/qbmmv3_e2e_golden.py",
+      "sha256": "4036899515a329c11a41ff74e68399a9b7ef54a17265b9d26d0d7305899d8ac9",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v3/tests/assets/qbmmv3_e2e_golden.py"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v4/tests/assets/qbmmv4_kernel_golden.py",
+      "sha256": "af99aa49a629f045750b6afc5c1faf8d246af0988a984eaa287cff92be12815e",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v4/tests/assets/qbmmv4_kernel_golden.py"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v4/tests/assets/qbmmv4_aclnn_golden.py",
+      "sha256": "ddda6dd25dc482f19015bb691f6e413b0b5d1e546692783cd783ddc023e3cf6c",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v4/tests/assets/qbmmv4_aclnn_golden.py"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v4/tests/st/arch35/ttk_kernel_quant_batch_matmul_v4_st.csv",
+      "sha256": "8cf226d1adad09b10bed0bc742c92e722266e71ed205a32011489064aca48aea",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v4/tests/st/arch35/ttk_kernel_quant_batch_matmul_v4_st.csv"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v4/tests/st/arch35/ttk_aclnn_quant_batch_matmul_v5_st.csv",
+      "sha256": "e31ad210e38fe6b94e5762d85506db427b34e1a975eb3179b7586223e7833cfa",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v4/tests/st/arch35/ttk_aclnn_quant_batch_matmul_v5_st.csv"
+    },
+    {
+      "path": "matmul/quant_batch_matmul_v3/tests/st/arch35/ttk_kernel_quant_batch_matmul_v3_st.csv",
+      "sha256": "2816b89542320b6b1ba947482358a4871b5729033362171910d0e58febfe1a1e",
+      "source_url": "https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v3/tests/st/arch35/ttk_kernel_quant_batch_matmul_v3_st.csv"
+    }
+  ],
+  "runtime_dependencies": [
+    "numpy",
+    "torch",
+    "en_dtypes",
+    "ml_dtypes"
+  ],
+  "notes": [
+    "Original upstream files kept byte-for-byte; golden import requires en_dtypes even when calling compute_mx with float32 decoded arrays. No dependency shims are provided.",
+    "MXA8W4 uses V4 compute_mx; MXA8W8 uses V3 compute_mx. Official CSV source contains MXA8W4 ST cases but no MXA8W8 ST row in the vendored V3 CSV. W8 controls are explicitly derived.",
+    "op-plugin master MXFP8 test functions are not used as an accuracy oracle: undefined self-assignment scale_clone=scale_clone.clone() and NumPy-to-PyTorch method misuse make those source cases unusable as supplied."
+  ]
+}
