@@ -1,0 +1,1646 @@
+diff --git a/csrc/attention/quant_lightning_indexer_v2/qli_v2_mxfp4_validation.h b/csrc/attention/quant_lightning_indexer_v2/qli_v2_mxfp4_validation.h
+new file mode 100644
+index 000000000..be6c27ac5
+--- /dev/null
++++ b/csrc/attention/quant_lightning_indexer_v2/qli_v2_mxfp4_validation.h
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#pragma once
++
++#include <ATen/ATen.h>
++#include <c10/util/Exception.h>
++
++namespace vllm_ascend {
++
++inline void CheckQLIV2MxFp4Inputs(
++    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
++    const at::Tensor &query_scale, const at::Tensor &key_scale,
++    c10::string_view layout_q, c10::string_view layout_k)
++{
++    TORCH_CHECK(layout_q == "TND" && layout_k == "PA_BBND",
++                "MXFP4 QLI V2 wrapper supports TND query and PA_BBND key");
++    TORCH_CHECK(query.dim() == 3 && key.dim() == 4,
++                "MXFP4 QLI V2 requires query [T,N,64], key [blocks,block_size,1,64]");
++    TORCH_CHECK(query.size(2) == 64 && key.size(3) == 64 && key.size(2) == 1,
++                "MXFP4 QLI V2 requires packed D64 bytes (logical D128), with one K head");
++    TORCH_CHECK(query.size(1) >= 1 && query.size(1) <= 64,
++                "MXFP4 QLI V2 query head count must be in [1,64]");
++    for (const auto &tensor : {query, key}) {
++        TORCH_CHECK(tensor.scalar_type() == at::kByte ||
++                    tensor.scalar_type() == at::kFloat4_e2m1fn_x2,
++                    "MXFP4 QLI V2 Q/K must use packed uint8 or float4_e2m1fn_x2 storage");
++    }
++    TORCH_CHECK(query_scale.dim() == 4 && query_scale.size(0) == query.size(0) &&
++                    query_scale.size(1) == query.size(1) && query_scale.size(2) == 2 && query_scale.size(3) == 2,
++                "MXFP4 QLI V2 query scale must be [T,N,2,2]");
++    TORCH_CHECK(key_scale.dim() == 5 && key_scale.size(0) == key.size(0) &&
++                    key_scale.size(1) == key.size(1) && key_scale.size(2) == 1 &&
++                    key_scale.size(3) == 2 && key_scale.size(4) == 2,
++                "MXFP4 QLI V2 key scale must be [blocks,block_size,1,2,2]");
++    for (const auto &tensor : {query_scale, key_scale}) {
++        TORCH_CHECK(tensor.scalar_type() == at::kByte ||
++                    tensor.scalar_type() == at::kFloat8_e8m0fnu,
++                    "MXFP4 QLI V2 scales must use uint8 E8M0 bits or float8_e8m0fnu");
++        TORCH_CHECK(tensor.storage_offset() % 2 == 0,
++                    "MXFP4 QLI V2 E8M0 storage offsets must be aligned to scale pairs");
++    }
++    TORCH_CHECK(query.is_contiguous() && query_scale.is_contiguous(),
++                "MXFP4 QLI V2 query and query scale must be contiguous");
++    for (const auto &tensor : {key, key_scale}) {
++        int64_t stride = 1;
++        for (int64_t axis = tensor.dim() - 1; axis >= 1; --axis) {
++            TORCH_CHECK(tensor.size(axis) == 1 || tensor.stride(axis) == stride,
++                        "MXFP4 QLI V2 caches may be noncontiguous only on axis 0");
++            stride *= tensor.size(axis);
++        }
++        TORCH_CHECK(tensor.stride(0) >= stride && tensor.stride(0) % 2 == 0,
++                    "MXFP4 QLI V2 cache blocks must be disjoint and pair-aligned");
++    }
++    TORCH_CHECK(weights.scalar_type() == at::kFloat && weights.is_contiguous() &&
++                weights.dim() == 2 && weights.size(0) == query.size(0) && weights.size(1) == query.size(1),
++                "MXFP4 QLI V2 weights must be contiguous FP32 [T,N]");
++}
++
++}  // namespace vllm_ascend
+diff --git a/csrc/attention/quant_lightning_indexer_v2/qli_v2_packed_layout.h b/csrc/attention/quant_lightning_indexer_v2/qli_v2_packed_layout.h
+new file mode 100644
+index 000000000..ebdd4a6b8
+--- /dev/null
++++ b/csrc/attention/quant_lightning_indexer_v2/qli_v2_packed_layout.h
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#pragma once
++
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++namespace vllm_ascend {
++
++struct QLIV2PackedLayout {
++    std::vector<int64_t> shape;
++    std::vector<int64_t> strides;
++    int64_t storage_offset;
++    int64_t storage_size;
++};
++
++inline int64_t QLIV2DoubleChecked(int64_t value)
++{
++    if (value < 0 || value > std::numeric_limits<int64_t>::max() / 2) {
++        throw std::invalid_argument("QLI V2 packed FP4 descriptor exceeds the logical element range");
++    }
++    return value * 2;
++}
++
++// Packed E2M1 tensors expose bytes to PyTorch and logical nibbles to ACL.
++// This adapter intentionally supports packing along the contiguous last axis
++// used by TND/PA_BBND indexers, not arbitrary transposed low-bit tensors.
++inline QLIV2PackedLayout MakeQLIV2PackedLayout(
++    std::vector<int64_t> shape, std::vector<int64_t> strides,
++    int64_t storage_offset, int64_t storage_bytes)
++{
++    if (shape.empty() || shape.size() != strides.size() || strides.back() != 1) {
++        throw std::invalid_argument("QLI V2 packed FP4 requires a contiguous innermost byte axis");
++    }
++    shape.back() = QLIV2DoubleChecked(shape.back());
++    for (size_t axis = 0; axis + 1 < strides.size(); ++axis) {
++        strides[axis] = QLIV2DoubleChecked(strides[axis]);
++    }
++    return {shape, strides, QLIV2DoubleChecked(storage_offset), QLIV2DoubleChecked(storage_bytes)};
++}
++
++}  // namespace vllm_ascend
+diff --git a/csrc/attention/quant_lightning_indexer_v2/qli_v2_torch_adapter.h b/csrc/attention/quant_lightning_indexer_v2/qli_v2_torch_adapter.h
+new file mode 100644
+index 000000000..10e0cf1b4
+--- /dev/null
++++ b/csrc/attention/quant_lightning_indexer_v2/qli_v2_torch_adapter.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#pragma once
++
++// Include after aclnn_torch_adapter/op_api_common.h. ADL selects this scoped
++// overload in ConvertTypes; all existing operators keep their current adapter.
++#include "qli_v2_packed_layout.h"
++
++namespace vllm_ascend {
++
++struct QLIV2TensorWrapper {
++    const at::Tensor &tensor;
++    aclDataType logical_dtype;
++};
++
++inline aclTensor *ConvertType(const QLIV2TensorWrapper &wrapped)
++{
++    static const auto create_tensor = GET_OP_API_FUNC(aclCreateTensor);
++    TORCH_CHECK(create_tensor != nullptr, "aclCreateTensor is unavailable");
++    const auto &tensor = wrapped.tensor;
++    TORCH_CHECK(IsOpInputBaseFormat(tensor) && tensor.element_size() == 1,
++                "MXFP4 QLI V2 requires base-format, byte-addressed tensor storage");
++    std::vector<int64_t> shape(tensor.sizes().begin(), tensor.sizes().end());
++    std::vector<int64_t> strides(tensor.strides().begin(), tensor.strides().end());
++    int64_t offset = tensor.storage_offset();
++    int64_t storage_size = tensor.storage().nbytes();
++    if (wrapped.logical_dtype == ACL_FLOAT4_E2M1) {
++        auto layout = MakeQLIV2PackedLayout(shape, strides, offset, storage_size);
++        shape = std::move(layout.shape);
++        strides = std::move(layout.strides);
++        offset = layout.storage_offset;
++        storage_size = layout.storage_size;
++    } else {
++        TORCH_CHECK(wrapped.logical_dtype == ACL_FLOAT8_E8M0,
++                    "QLI V2 byte wrapper only supports E2M1 or E8M0");
++    }
++    return create_tensor(shape.data(), shape.size(), wrapped.logical_dtype,
++                         strides.data(), offset, ACL_FORMAT_ND, &storage_size, 1,
++                         const_cast<void *>(tensor.storage().data()));
++}
++
++}  // namespace vllm_ascend
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index c9507a56e..420c62534 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -29,6 +29,8 @@
+ #include "ops.h"
+ #include "utils.h"
+ #include "aclnn_torch_adapter/op_api_common.h"
++#include "attention/quant_lightning_indexer_v2/qli_v2_mxfp4_validation.h"
++#include "attention/quant_lightning_indexer_v2/qli_v2_torch_adapter.h"
+ #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
+ #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+ #include "mla_preprocess/mla_preprocess_torch_adpt.h"
+@@ -1029,6 +1031,41 @@ std::tuple<at::Tensor, at::Tensor> construct_quant_lightning_indexer_output_tens
+     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
+ }
+ 
++std::tuple<at::Tensor, at::Tensor> construct_quant_lightning_indexer_v2_output_tensor(const at::Tensor& query, const at::Tensor& key,
++                                                           int64_t sparse_count, std::string query_layout_str,
++                                                           std::string key_layout_str, int64_t return_value)
++{
++    constexpr int64_t SIZE = 8;
++    constexpr int64_t DIM_0 = 0;
++    constexpr int64_t DIM_1 = 1;
++    constexpr int64_t DIM_2 = 2;
++    at::SmallVector<int64_t, SIZE> output_size;
++    for (size_t i = 0; i < query.sizes().size(); i++) {
++        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
++            "than 0, but shape[", i, "] is ", query.size(i));
++    }
++    for (size_t i = 0; i < key.sizes().size(); i++) {
++        TORCH_CHECK(key.size(i) > 0, "All values within key's shape should be greater "
++            "than 0, but shape[", i, "] is ", key.size(i));
++    }
++    TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
++    int64_t keyHeadNum = (key_layout_str == "TND") ? key.size(DIM_1) : key.size(DIM_2);
++    if (query_layout_str == "BSND") {
++        output_size = {query.size(DIM_0), query.size(DIM_1), keyHeadNum, sparse_count};
++    } else {
++        output_size = {query.size(DIM_0), keyHeadNum, sparse_count};
++    }
++    at::Tensor sparse_indices_out = at::empty(output_size, query.options().dtype(at::kInt));
++    at::Tensor sparse_values_out;
++    if (return_value) {
++        sparse_values_out = at::empty(output_size, query.options().dtype(at::kBFloat16));
++    } else {
++        sparse_values_out = at::empty({0}, query.options().dtype(at::kBFloat16));
++    }
++
++    return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
++}
++
+ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_npu(
+     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+     const at::Tensor &query_dequant_scale, const at::Tensor &key_dequant_scale,
+@@ -1070,6 +1107,63 @@ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_npu(
+     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
+ }
+ 
++std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_npu(
++    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
++    const at::Tensor &query_dequant_scale, const at::Tensor &key_dequant_scale,
++    int64_t topk, int64_t quant_mode,
++    const c10::optional<at::Tensor> &cu_seqlens_q,
++    const c10::optional<at::Tensor> &cu_seqlens_k,
++    const c10::optional<at::Tensor> &seqused_q,
++    const c10::optional<at::Tensor> &seqused_k,
++    const c10::optional<at::Tensor> &cmp_residual_k,
++    const c10::optional<at::Tensor> &block_table,
++    const c10::optional<at::Tensor> &output_idx_offset,
++    const c10::optional<at::Tensor> &metadata,
++    int64_t max_seqlen_q, c10::string_view layout_q, c10::string_view layout_k,
++    int64_t mask_mode, int64_t cmp_ratio, int64_t return_value)
++{
++    TORCH_CHECK(query.numel() > 0, "Tensor query is empty.");
++    TORCH_CHECK(key.numel() > 0, "Tensor key is empty.");
++    std::string query_layout_str = std::string(layout_q);
++    std::string key_layout_str = std::string(layout_k);
++
++    std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer_output = construct_quant_lightning_indexer_v2_output_tensor(
++            query, key, topk, query_layout_str, key_layout_str, return_value);
++    at::Tensor sparse_indices_out = std::get<0>(quant_lightning_indexer_output);
++    at::Tensor sparse_values_out = std::get<1>(quant_lightning_indexer_output);
++    char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
++    char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
++
++    if (key_layout_str == "PA_BSND" || key_layout_str == "PA_BBND") {
++        auto contiguous_axes_result_key = is_contiguous_axes(key);
++        TORCH_CHECK(contiguous_axes_result_key[1] && contiguous_axes_result_key[2],
++                    "key must be contiguous on all axes except axis 0");
++        auto contiguous_axes_result_key_scale = is_contiguous_axes(key_dequant_scale);
++        TORCH_CHECK(contiguous_axes_result_key_scale[1] && contiguous_axes_result_key_scale[2],
++                    "key_dequant_scale must be contiguous on all axes except axis 0");
++    }
++
++    if (quant_mode == 5) {
++        CheckQLIV2MxFp4Inputs(query, key, weights, query_dequant_scale, key_dequant_scale, layout_q, layout_k);
++        QLIV2TensorWrapper q{query, ACL_FLOAT4_E2M1};
++        QLIV2TensorWrapper k{key, ACL_FLOAT4_E2M1};
++        QLIV2TensorWrapper qs{query_dequant_scale, ACL_FLOAT8_E8M0};
++        QLIV2TensorWrapper ks{key_dequant_scale, ACL_FLOAT8_E8M0};
++        EXEC_NPU_CMD(aclnnQuantLightningIndexerV2, q, k, weights, qs, ks,
++            cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k, block_table, output_idx_offset, metadata,
++            topk, quant_mode, max_seqlen_q, query_layout_ptr, key_layout_ptr, mask_mode, cmp_ratio, return_value,
++            sparse_indices_out, sparse_values_out);
++        return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
++    }
++
++    EXEC_NPU_CMD(aclnnQuantLightningIndexerV2, query, key, weights, query_dequant_scale, key_dequant_scale,
++        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k, block_table, output_idx_offset, metadata,
++        topk, quant_mode, max_seqlen_q, query_layout_ptr, key_layout_ptr, mask_mode, cmp_ratio, return_value,
++        sparse_indices_out, sparse_values_out);
++
++    return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
++}
++
+ std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q, std::string layout,
+     bool return_softmax_lse)
+ {
+@@ -1221,6 +1315,47 @@ at::Tensor npu_vllm_quant_lightning_indexer_metadata_npu(
+     return output;
+ }
+ 
++at::Tensor npu_quant_lightning_indexer_v2_metadata_npu(
++    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim, int64_t topk, int64_t quant_mode,
++    const c10::optional<at::Tensor> &cu_seqlens_q, const c10::optional<at::Tensor> &cu_seqlens_k,
++    const c10::optional<at::Tensor> &seqused_q, const c10::optional<at::Tensor> &seqused_k,
++    const c10::optional<at::Tensor> &cmp_residual_k, int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k,
++    const c10::string_view layout_q, c10::string_view layout_k, int64_t mask_mode, int64_t cmp_ratio,
++    const c10::string_view device)
++{
++    constexpr int64_t OUTPUT_SIZE = 1024;
++    at::Device output_device = at::Device(std::string(device));
++    if (cu_seqlens_q.has_value()) {
++        output_device = cu_seqlens_q.value().device();
++    } else if (seqused_k.has_value()) {
++        output_device = seqused_k.value().device();
++    } else if (cu_seqlens_k.has_value()) {
++        output_device = cu_seqlens_k.value().device();
++    } else if (seqused_q.has_value()) {
++        output_device = seqused_q.value().device();
++    } else if (cmp_residual_k.has_value()) {
++        output_device = cmp_residual_k.value().device();
++    }
++
++    at::Tensor output = torch::empty({OUTPUT_SIZE}, torch::dtype(torch::kInt32).device(output_device));
++    auto cu_seqlens_q_val = get_valid_tensor(cu_seqlens_q, output_device);
++    auto cu_seqlens_k_val = get_valid_tensor(cu_seqlens_k, output_device);
++    auto seqused_q_val = get_valid_tensor(seqused_q, output_device);
++    auto seqused_k_val = get_valid_tensor(seqused_k, output_device);
++    auto cmp_residual_k_val = get_valid_tensor(cmp_residual_k, output_device);
++
++    std::string layout_q_str = std::string(layout_q);
++    char *layout_q_ptr = const_cast<char *>(layout_q_str.c_str());
++    std::string layout_k_str = std::string(layout_k);
++    char *layout_k_ptr = const_cast<char *>(layout_k_str.c_str());
++
++    EXEC_NPU_CMD(aclnnQuantLightningIndexerV2Metadata, cu_seqlens_q_val, cu_seqlens_k_val, seqused_q_val, seqused_k_val,
++                 cmp_residual_k_val, num_heads_q, num_heads_k, head_dim, topk, quant_mode, batch_size, max_seqlen_q,
++                 max_seqlen_k, layout_q_ptr, layout_k_ptr, mask_mode, cmp_ratio, output);
++
++    return output;
++}
++
+ at::Tensor construct_hc_post_output_tensor(const at::Tensor& residual)
+ {
+     constexpr int64_t SIZE = 8;
+@@ -2789,6 +2924,26 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+         );
+     ops.impl("npu_vllm_quant_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_vllm_quant_lightning_indexer_npu);
+ 
++    ops.def(
++        "npu_quant_lightning_indexer_v2("
++            "Tensor query, Tensor key, Tensor weights, "
++            "Tensor query_dequant_scale, Tensor key_dequant_scale, "
++            "int topk, int quant_mode, *, "
++            "Tensor? cu_seqlens_q=None, "
++            "Tensor? cu_seqlens_k=None, "
++            "Tensor? seqused_q=None, "
++            "Tensor? seqused_k=None, "
++            "Tensor? cmp_residual_k=None, "
++            "Tensor? block_table=None, "
++            "Tensor? output_idx_offset=None, "
++            "Tensor? metadata=None, "
++            "int max_seqlen_q=-1, "
++            "str layout_q=\"TND\", str layout_k=\"PA_BBND\", "
++            "int mask_mode=3, int cmp_ratio=4, int return_value=0"
++        ") -> (Tensor sparse_indices, Tensor sparse_values)"
++        );
++    ops.impl("npu_quant_lightning_indexer_v2", torch::kPrivateUse1, &vllm_ascend::npu_quant_lightning_indexer_v2_npu);
++
+     ops.def(
+         "npu_sparse_attn_sharedkv("
+             "Tensor q, *, "
+@@ -2871,6 +3026,30 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+         );
+     ops.impl("npu_vllm_quant_lightning_indexer_metadata", torch::kPrivateUse1, &vllm_ascend::npu_vllm_quant_lightning_indexer_metadata_npu);
+ 
++    ops.def(
++        "npu_quant_lightning_indexer_v2_metadata("
++            "int num_heads_q, "
++            "int num_heads_k, "
++            "int head_dim, "
++            "int topk, "
++            "int quant_mode, *, "
++            "Tensor? cu_seqlens_q=None, "
++            "Tensor? cu_seqlens_k=None, "
++            "Tensor? seqused_q=None, "
++            "Tensor? seqused_k=None, "
++            "Tensor? cmp_residual_k=None, "
++            "int batch_size=0, "
++            "int max_seqlen_q=-1, "
++            "int max_seqlen_k=-1, "
++            "str layout_q=\"TND\", "
++            "str layout_k=\"PA_BBND\", "
++            "int mask_mode=3, "
++            "int cmp_ratio=4, "
++            "str device=\"npu\""
++        ") -> (Tensor metadata)"
++        );
++    ops.impl("npu_quant_lightning_indexer_v2_metadata", torch::kPrivateUse1, &vllm_ascend::npu_quant_lightning_indexer_v2_metadata_npu);
++
+     ops.def(
+           "npu_hc_post("
+             "Tensor x, "
+diff --git a/csrc/torch_binding_meta.cpp b/csrc/torch_binding_meta.cpp
+index f336841a4..f7bbd2138 100644
+--- a/csrc/torch_binding_meta.cpp
++++ b/csrc/torch_binding_meta.cpp
+@@ -1,3 +1,4 @@
++#include "attention/quant_lightning_indexer_v2/qli_v2_mxfp4_validation.h"
+ #include <torch/extension.h>
+ #include <torch/library.h>
+ #include <torch/version.h>
+@@ -848,6 +849,32 @@ std::tuple<at::Tensor, at::Tensor> construct_quant_lightning_indexer_output_tens
+     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
+ }
+ 
++std::tuple<at::Tensor, at::Tensor> construct_quant_lightning_indexer_v2_output_tensor(const at::Tensor& query, const at::Tensor& key,
++                                                           int64_t sparse_count, std::string query_layout_str,
++                                                           std::string key_layout_str, int64_t return_value)
++{
++    constexpr int64_t DIM_0 = 0;
++    constexpr int64_t DIM_1 = 1;
++    constexpr int64_t DIM_2 = 2;
++    c10::SymDimVector output_size;
++    TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
++    c10::SymInt keyHeadNum = (key_layout_str == "TND") ? key.sym_size(DIM_1) : key.sym_size(DIM_2);
++    if (query_layout_str == "BSND") {
++        output_size = {query.sym_size(DIM_0), query.sym_size(DIM_1), keyHeadNum, c10::SymInt(sparse_count)};
++    } else {
++        output_size = {query.sym_size(DIM_0), keyHeadNum, c10::SymInt(sparse_count)};
++    }
++    at::Tensor sparse_indices_out = at::empty_symint(output_size, query.options().dtype(at::kInt));
++    at::Tensor sparse_values_out;
++    if (return_value) {
++        sparse_values_out = at::empty_symint(output_size, query.options().dtype(at::kBFloat16));
++    } else {
++        sparse_values_out = at::empty_symint(c10::SymDimVector{c10::SymInt(0)}, query.options().dtype(at::kBFloat16));
++    }
++
++    return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
++}
++
+ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_meta(
+     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+     const at::Tensor &query_dequant_scale, const at::Tensor &key_dequant_scale,
+@@ -869,6 +896,34 @@ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_meta(
+     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
+ }
+ 
++std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_meta(
++    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
++    const at::Tensor &query_dequant_scale, const at::Tensor &key_dequant_scale,
++    int64_t topk, int64_t quant_mode,
++    const c10::optional<at::Tensor> &cu_seqlens_q,
++    const c10::optional<at::Tensor> &cu_seqlens_k,
++    const c10::optional<at::Tensor> &seqused_q,
++    const c10::optional<at::Tensor> &seqused_k,
++    const c10::optional<at::Tensor> &cmp_residual_k,
++    const c10::optional<at::Tensor> &block_table,
++    const c10::optional<at::Tensor> &output_idx_offset,
++    const c10::optional<at::Tensor> &metadata,
++    int64_t max_seqlen_q, c10::string_view layout_q, c10::string_view layout_k,
++    int64_t mask_mode, int64_t cmp_ratio, int64_t return_value)
++{
++    if (quant_mode == 5) {
++        vllm_ascend::CheckQLIV2MxFp4Inputs(query, key, weights, query_dequant_scale, key_dequant_scale, layout_q, layout_k);
++    }
++    std::string query_layout_str = std::string(layout_q);
++    std::string key_layout_str = std::string(layout_k);
++    std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer_output = construct_quant_lightning_indexer_v2_output_tensor(
++            query, key, topk, query_layout_str, key_layout_str, return_value);
++    at::Tensor sparse_indices_out = std::get<0>(quant_lightning_indexer_output);
++    at::Tensor sparse_values_out = std::get<1>(quant_lightning_indexer_output);
++
++    return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
++}
++
+ std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q, std::string layout,
+     bool return_softmax_lse)
+ {
+@@ -992,6 +1047,47 @@ at::Tensor npu_vllm_quant_lightning_indexer_metadata_meta(
+     return output;
+ }
+ 
++at::Tensor npu_quant_lightning_indexer_v2_metadata_meta(
++    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim, int64_t topk, int64_t quant_mode,
++    const c10::optional<at::Tensor> &cu_seqlens_q, const c10::optional<at::Tensor> &cu_seqlens_k,
++    const c10::optional<at::Tensor> &seqused_q, const c10::optional<at::Tensor> &seqused_k,
++    const c10::optional<at::Tensor> &cmp_residual_k, int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k,
++    const c10::string_view layout_q, c10::string_view layout_k, int64_t mask_mode, int64_t cmp_ratio,
++    const c10::string_view device)
++{
++    constexpr int64_t OUTPUT_SIZE = 1024;
++    at::Tensor output;
++    if (cu_seqlens_q.has_value()) {
++        output = at::empty_symint(
++            c10::SymDimVector{c10::SymInt(OUTPUT_SIZE)},
++            torch::dtype(torch::kInt32).device(cu_seqlens_q.value().device()));
++    } else if (seqused_k.has_value()) {
++        output = at::empty_symint(
++            c10::SymDimVector{c10::SymInt(OUTPUT_SIZE)},
++            torch::dtype(torch::kInt32).device(seqused_k.value().device()));
++    } else if (cu_seqlens_k.has_value()) {
++        output = at::empty_symint(
++            c10::SymDimVector{c10::SymInt(OUTPUT_SIZE)},
++            torch::dtype(torch::kInt32).device(cu_seqlens_k.value().device()));
++    } else if (seqused_q.has_value()) {
++        output = at::empty_symint(
++            c10::SymDimVector{c10::SymInt(OUTPUT_SIZE)},
++            torch::dtype(torch::kInt32).device(seqused_q.value().device()));
++    } else {
++        auto deviceOri = at::Device(std::string(device));
++        std::string device_str = "meta";
++        if (deviceOri.has_index()) {
++            device_str += ":";
++            device_str += std::to_string(deviceOri.index());
++        }
++        output = at::empty_symint(
++            c10::SymDimVector{c10::SymInt(OUTPUT_SIZE)},
++            torch::dtype(torch::kInt32).device(at::Device(device_str)));
++    }
++
++    return output;
++}
++
+ at::Tensor construct_hc_post_output_tensor(const at::Tensor& residual)
+ {
+     c10::SymIntArrayRef output_size = residual.sym_sizes();
+@@ -2002,6 +2098,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("compressor_metadata", &vllm_ascend::meta::compressor_metadata_meta);
+     ops.impl("npu_vllm_quant_lightning_indexer", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_meta);
+     ops.impl("npu_vllm_quant_lightning_indexer_metadata", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_metadata_meta);
++    ops.impl("npu_quant_lightning_indexer_v2", &vllm_ascend::meta::npu_quant_lightning_indexer_v2_meta);
++    ops.impl("npu_quant_lightning_indexer_v2_metadata", &vllm_ascend::meta::npu_quant_lightning_indexer_v2_metadata_meta);
+     ops.impl("npu_sparse_attn_sharedkv", &vllm_ascend::meta::npu_sparse_attn_sharedkv_meta);
+     ops.impl("npu_sparse_attn_sharedkv_metadata", &vllm_ascend::meta::npu_sparse_attn_sharedkv_metadata_meta);
+     ops.impl("npu_hc_post", &vllm_ascend::meta::npu_hc_post_meta);
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_sfa_indexer_qli_v2.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_sfa_indexer_qli_v2.py
+new file mode 100644
+index 000000000..81cee46c8
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_sfa_indexer_qli_v2.py
+@@ -0,0 +1,164 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""A5 gates for GLM SFA QLI V2 (FP8 parity and MXFP4 execution)."""
++
++import pytest
++import torch
++import torch_npu
++
++from vllm_ascend.attention.sfa_indexer import (
++    QLI_V2_MXFP4,
++    SFAIndexerMetadataBuilder,
++    quantize_sfa_indexer_mxfp4,
++    select_sfa_topk,
++)
++from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
++from vllm_ascend.utils import enable_custom_op
++
++
++@pytest.fixture(autouse=True)
++def require_a5():
++    if not get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION):
++        pytest.skip("requires Ascend A5 FP8 attention")
++    enable_custom_op()
++    # Missing symbols on A5 are deployment failures, not successful skips.
++    assert hasattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2")
++    assert hasattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2_metadata")
++    assert hasattr(torch_npu, "npu_quant_lightning_indexer")
++    assert hasattr(torch_npu, "npu_dynamic_mx_quant")
++
++
++def make_inputs(q_lengths, k_lengths, strided, ranked):
++    torch.manual_seed(73)
++    block_size, heads, dim = 128, 64, 128
++    blocks_per_req = [(length + block_size - 1) // block_size for length in k_lengths]
++    num_blocks = sum(blocks_per_req)
++    block_ids = torch.randperm(num_blocks)
++    table = torch.zeros((len(k_lengths), max(blocks_per_req)), dtype=torch.int32)
++    scales = torch.rand(num_blocks, block_size, 1) + 0.5
++    offset = 0
++    for row, (length, count) in enumerate(zip(k_lengths, blocks_per_req)):
++        table[row, :count] = block_ids[offset : offset + count]
++        if ranked:
++            # Unique scores despite FP8 payload ties: larger logical token ids
++            # have larger FP32 K scales. Wrong causal alignment is observable.
++            for page in range(count):
++                scales[table[row, page], :, 0] = (torch.arange(block_size) + page * block_size + 1) / max(k_lengths)
++        offset += count
++    tokens = sum(q_lengths)
++    q = torch.ones(tokens, heads, dim) if ranked else torch.randn(tokens, heads, dim)
++    k = torch.ones(num_blocks, block_size, 1, dim) if ranked else torch.randn(num_blocks, block_size, 1, dim)
++    q = q.to(torch.float8_e4m3fn).npu()
++    k = k.to(torch.float8_e4m3fn).npu()
++    scales = scales.npu()
++    if strided:
++        storage = torch.empty(num_blocks * 2, block_size, 1, dim, dtype=k.dtype, device="npu")
++        scale_storage = torch.empty(num_blocks * 2, block_size, 1, dtype=torch.float32, device="npu")
++        storage[::2].copy_(k)
++        scale_storage[::2].copy_(scales)
++        k, scales = storage[::2], scale_storage[::2]
++    weights = torch.ones(tokens, heads, dtype=torch.bfloat16, device="npu")
++    q_scale = torch.ones(tokens, heads, dtype=torch.float32, device="npu")
++    q_ends = torch.tensor(q_lengths, dtype=torch.int32, device="npu").cumsum(0, dtype=torch.int32)
++    k_lengths_npu = torch.tensor(k_lengths, dtype=torch.int32, device="npu")
++    return q, k, weights, q_scale, scales, table.npu(), q_ends, k_lengths_npu
++
++
++def legacy(inputs):
++    q, k, weights, q_scale, k_scale, table, q_ends, k_lengths = inputs
++    return torch_npu.npu_quant_lightning_indexer(
++        query=q,
++        key=k.contiguous(),
++        weights=weights,
++        query_dequant_scale=q_scale,
++        key_dequant_scale=k_scale.contiguous(),
++        actual_seq_lengths_query=q_ends,
++        actual_seq_lengths_key=k_lengths,
++        block_table=table,
++        query_quant_mode=0,
++        key_quant_mode=0,
++        layout_query="TND",
++        layout_key="PA_BSND",
++        sparse_count=2048,
++        sparse_mode=3,
++    )
++
++
++def assert_topk(actual, expected, q_lengths, k_lengths):
++    actual, expected = actual.cpu(), expected.cpu()
++    assert actual.shape == expected.shape == (sum(q_lengths), 1, 2048)
++    assert actual.dtype == expected.dtype == torch.int32
++    cursor = 0
++    for q_len, k_len in zip(q_lengths, k_lengths):
++        for index in range(q_len):
++            causal_length = k_len - q_len + index + 1
++            new = actual[cursor + index, 0]
++            old = expected[cursor + index, 0]
++            valid = new[new >= 0]
++            assert valid.numel() == min(2048, causal_length)
++            assert valid.unique().numel() == valid.numel()
++            assert (valid < causal_length).all()
++            # Index order is immaterial to SFA. Keep the set gate strict;
++            # investigate cutoff ties or reduction changes before relaxing it.
++            torch.testing.assert_close(new.sort().values, old.sort().values, rtol=0, atol=0)
++        cursor += q_len
++
++
++@pytest.mark.parametrize(
++    ("q_lengths", "k_lengths"),
++    [([3, 5], [3, 5]), ([3, 5], [4096, 6000]), ([1, 1], [128, 8192]), ([4, 4], [4097, 8193])],
++    ids=["ragged-prefill", "chunked-prefill", "decode", "speculative-decode"],
++)
++@pytest.mark.parametrize("strided", [False, True], ids=["dense-blocks", "strided-blocks"])
++@pytest.mark.parametrize("ranked", [True, False], ids=["unique-ranking", "random"])
++@torch.inference_mode()
++def test_sfa_fp8_legacy_v2(q_lengths, k_lengths, strided, ranked):
++    inputs = make_inputs(q_lengths, k_lengths, strided, ranked)
++    q, k, weights, q_scale, k_scale, table, q_ends, key_lengths = inputs
++    builder = SFAIndexerMetadataBuilder(64, 128, len(q_lengths), torch.device("npu"))
++    metadata = builder.build(q_ends, key_lengths)
++    actual = select_sfa_topk(q, k, weights, q_scale, k_scale, table, metadata)
++    assert_topk(actual, legacy(inputs), q_lengths, k_lengths)
++
++
++@torch.inference_mode()
++def test_sfa_v2_graph_replay_refreshes_lengths():
++    inputs = make_inputs([1, 1], [4096, 8192], True, True)
++    q, k, weights, q_scale, k_scale, table, q_ends, key_lengths = inputs
++    builder = SFAIndexerMetadataBuilder(64, 128, 2, torch.device("npu"))
++    metadata = builder.build(q_ends, key_lengths)
++    select_sfa_topk(q, k, weights, q_scale, k_scale, table, metadata)
++    torch.npu.synchronize()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph, capture_error_mode="thread_local", auto_dispatch_capture=True):
++        output = select_sfa_topk(q, k, weights, q_scale, k_scale, table, metadata)
++    for lengths in ([3000, 5000], [3500, 7000]):
++        key_lengths.copy_(torch.tensor(lengths, dtype=torch.int32, device="npu"))
++        refreshed = builder.build(q_ends, key_lengths)
++        assert refreshed.schedule.data_ptr() == metadata.schedule.data_ptr()
++        graph.replay()
++        torch.npu.synchronize()
++        assert_topk(output, legacy(inputs), [1, 1], lengths)
++
++
++@torch.inference_mode()
++def test_sfa_mxfp4_mode5_executes_with_packed_cache_contract():
++    block_size, num_blocks, tokens = 128, 2, 2
++    q_float = torch.randn(tokens, 1, 128, device="npu", dtype=torch.float16)
++    k_float = torch.randn(num_blocks * block_size, 1, 128, device="npu", dtype=torch.float16)
++    q, q_scale = quantize_sfa_indexer_mxfp4(q_float, torch_npu)
++    k, k_scale = quantize_sfa_indexer_mxfp4(k_float, torch_npu)
++    k = k.view(num_blocks, block_size, 1, 64)
++    k_scale = k_scale.view(num_blocks, block_size, 1, 4)
++    weights = torch.ones(tokens, 1, dtype=torch.float32, device="npu")
++    block_table = torch.arange(num_blocks, dtype=torch.int32, device="npu").view(1, -1)
++    q_ends = torch.tensor([tokens], dtype=torch.int32, device="npu")
++    k_lengths = torch.tensor([block_size], dtype=torch.int32, device="npu")
++
++    builder = SFAIndexerMetadataBuilder(1, 128, 1, torch.device("npu"), quant_mode=QLI_V2_MXFP4)
++    metadata = builder.build(q_ends, k_lengths)
++    indices = select_sfa_topk(q, k, weights, q_scale, k_scale, block_table, metadata)
++    assert indices.shape == (tokens, 1, 2048)
++    assert indices.dtype == torch.int32
++    assert (indices[:, 0, 0] >= 0).all()
+diff --git a/tests/ut/attention/a2/test_sfa_v1.py b/tests/ut/attention/a2/test_sfa_v1.py
+index 0cf8701e8..d038c6429 100644
+--- a/tests/ut/attention/a2/test_sfa_v1.py
++++ b/tests/ut/attention/a2/test_sfa_v1.py
+@@ -28,7 +28,7 @@ from vllm_ascend.attention.sfa_v1 import (
+     custom_kv_rmsnorm_rope,
+ )
+ from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
+-from vllm_ascend.device.device_op import BaseDeviceAdaptor, DeviceOperator
++from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor, DeviceOperator
+ from vllm_ascend.quantization.methods import (
+     AscendW8A8DynamicLinearMethod,
+     AscendW8A8LinearMethod,
+@@ -1198,3 +1198,54 @@ class TestAscendSFAImpl(TestBase):
+         self.assertIs(impl._quant_type, AscendW8A8MXFP8DynamicLinearMethod)
+ 
+     # (MLAPO runtime path requires NPU hardware; covered by integration tests.)
++
++
++class TestA5GlmIndexerV2Dispatch(TestBase):
++    def test_glm_uses_v2_with_both_main_cache_layouts(self):
++        for packed_main in (False, True):
++            main_count = 1 if packed_main else 2
++            key = torch.empty(2, 128, 1, 128, dtype=torch.float8_e4m3fn)
++            key_scale = torch.empty(2, 128, 1, 1, dtype=torch.float32)
++            cache = (*(torch.empty(1) for _ in range(main_count)), key, key_scale)
++            impl = SimpleNamespace(
++                enable_sparse_sfa_c8=packed_main,
++                kv_cache_indexer_k_idx=main_count,
++                kv_cache_indexer_scale_idx=main_count + 1,
++            )
++            metadata = SimpleNamespace(qli_v2=object(), block_table=torch.zeros(1, 1, dtype=torch.int32))
++            with patch("vllm_ascend.device.device_op.select_sfa_topk") as select:
++                result = A5DeviceAdaptor.indexer_select_post_process(
++                    impl,
++                    torch.empty(64, 128, dtype=torch.float8_e4m3fn),
++                    torch.ones(64),
++                    (1, 64, 128),
++                    torch.ones(1, 64, dtype=torch.bfloat16),
++                    cache,
++                    metadata,
++                    torch.tensor([1], dtype=torch.int32),
++                    torch.tensor([128], dtype=torch.int32),
++                    True,
++                    True,
++                )
++                self.assertIs(result, select.return_value)
++                self.assertIs(select.call_args.kwargs["key"], key)
++                self.assertEqual(select.call_args.kwargs["key_scale"].shape, (2, 128, 1))
++                self.assertEqual(select.call_args.kwargs["query"].shape, (1, 64, 128))
++                self.assertIs(select.call_args.kwargs["metadata"], metadata.qli_v2)
++
++    def test_missing_glm_metadata_fails_instead_of_using_legacy(self):
++        impl = SimpleNamespace(enable_sparse_sfa_c8=False, kv_cache_indexer_k_idx=2, kv_cache_indexer_scale_idx=3)
++        with self.assertRaisesRegex(RuntimeError, "requires QLI V2 metadata"):
++            A5DeviceAdaptor.indexer_select_post_process(
++                impl,
++                torch.empty(64, 128, dtype=torch.float8_e4m3fn),
++                torch.ones(64),
++                (1, 64, 128),
++                torch.ones(1, 64, dtype=torch.bfloat16),
++                (torch.empty(1), torch.empty(1), torch.empty(2, 128, 1, 128), torch.empty(2, 128, 1, 1)),
++                SimpleNamespace(qli_v2=None),
++                torch.tensor([1], dtype=torch.int32),
++                torch.tensor([128], dtype=torch.int32),
++                True,
++                True,
++            )
+diff --git a/tests/ut/attention/test_sfa_indexer.py b/tests/ut/attention/test_sfa_indexer.py
+new file mode 100644
+index 000000000..1c38c38f6
+--- /dev/null
++++ b/tests/ut/attention/test_sfa_indexer.py
+@@ -0,0 +1,179 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm_ascend.attention.sfa_indexer import (
++    QLI_V2_MXFP4,
++    SFAIndexerMetadataBuilder,
++    quantize_sfa_indexer_mxfp4,
++    select_sfa_topk,
++)
++
++
++@pytest.fixture
++def metadata_calls(monkeypatch):
++    calls = []
++
++    def schedule(**kwargs):
++        calls.append(kwargs)
++        return torch.full((1024,), len(calls), dtype=torch.int32)
++
++    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2_metadata", schedule, raising=False)
++    return calls
++
++
++@pytest.mark.parametrize(
++    ("q_ends", "k_lengths"),
++    [([3, 8], [3, 5]), ([1, 2], [4096, 8192]), ([4, 7], [3000, 6000]), ([0, 3, 3], [0, 301, 0])],
++)
++def test_uncompressed_request_lengths(metadata_calls, q_ends, k_lengths):
++    builder = SFAIndexerMetadataBuilder(64, 128, 16, torch.device("cpu"))
++    metadata = builder.build(torch.tensor(q_ends), torch.tensor(k_lengths))
++    assert metadata.cu_seqlens_q.tolist() == [0, *q_ends]
++    assert metadata.seqused_k.tolist() == k_lengths
++    assert metadata.cu_seqlens_q.dtype == metadata.seqused_k.dtype == torch.int32
++    call = metadata_calls[-1]
++    assert call["quant_mode"] == 1
++    assert call["cmp_ratio"] == 1
++    assert call["layout_k"] == "PA_BBND"
++    assert "cmp_residual_k" not in call
++    assert "cu_seqlens_k" not in call
++
++
++def test_graph_addresses_stay_stable_while_lengths_change(metadata_calls):
++    builder = SFAIndexerMetadataBuilder(64, 128, 16, torch.device("cpu"))
++    first = builder.build(torch.tensor([1, 2]), torch.tensor([127, 511]))
++    pointers = (first.cu_seqlens_q.data_ptr(), first.seqused_k.data_ptr(), first.schedule.data_ptr())
++    second = builder.build(torch.tensor([4, 8]), torch.tensor([131, 515]))
++    assert pointers == (second.cu_seqlens_q.data_ptr(), second.seqused_k.data_ptr(), second.schedule.data_ptr())
++    assert first.cu_seqlens_q.tolist() == [0, 4, 8]
++    assert first.seqused_k.tolist() == [131, 515]
++    assert first.schedule.tolist() == [2] * 1024
++    # Changing request count must not shift the underlying graph buffers.
++    smaller = builder.build(torch.tensor([1]), torch.tensor([1]))
++    assert smaller.cu_seqlens_q.data_ptr() == pointers[0]
++    assert smaller.seqused_k.tolist() == [1]
++
++
++def test_draft_metadata_does_not_overwrite_main_or_other_steps(metadata_calls):
++    builder = SFAIndexerMetadataBuilder(64, 128, 16, torch.device("cpu"))
++    main = builder.build(torch.tensor([1, 2]), torch.tensor([127, 255]))
++    draft = builder.build(torch.tensor([1, 2]), torch.tensor([128, 256]), draft_index=1)
++    later = builder.build(torch.tensor([1, 2]), torch.tensor([129, 257]), draft_index=2)
++    assert len({m.schedule.data_ptr() for m in (main, draft, later)}) == 3
++    assert main.seqused_k.tolist() == [127, 255]
++    builder.build(torch.tensor([1, 2]), torch.tensor([130, 258]), draft_index=1)
++    assert draft.seqused_k.tolist() == [130, 258]
++    assert later.seqused_k.tolist() == [129, 257]
++
++
++@pytest.mark.parametrize(("q", "k"), [([1, 2], [1]), ([1, 2, 3], [1, 2, 3])])
++def test_reject_incompatible_request_counts(metadata_calls, q, k):
++    builder = SFAIndexerMetadataBuilder(64, 128, 2, torch.device("cpu"))
++    with pytest.raises(ValueError, match="request counts"):
++        builder.build(torch.tensor(q), torch.tensor(k))
++    assert not metadata_calls
++
++
++def test_fp8_consumer_preserves_cache_views_and_quantization(metadata_calls, monkeypatch):
++    metadata = SFAIndexerMetadataBuilder(64, 128, 2, torch.device("cpu")).build(
++        torch.tensor([1, 2]), torch.tensor([128, 256])
++    )
++    q = torch.randn(2, 64, 128).to(torch.float8_e4m3fn)
++    key = torch.randn(8, 128, 1, 128).to(torch.float8_e4m3fn)[::2]
++    key_scale = torch.rand(8, 128, 1)[::2]
++    q_scale = torch.rand(2, 64)
++    # SFA weights come from a slice of the fused WK/weights projection.
++    weights = torch.randn(2, 128 + 64, dtype=torch.bfloat16)[:, 128:]
++    block_table = torch.tensor([[3, 0], [1, 2]], dtype=torch.int32)
++    output = torch.empty(2, 1, 2048, dtype=torch.int32)
++    before = key.view(torch.uint8).clone()
++
++    def compute(**kwargs):
++        assert kwargs["query"] is q
++        assert kwargs["key"] is key
++        assert kwargs["query_dequant_scale"] is q_scale
++        assert kwargs["key_dequant_scale"] is key_scale
++        assert kwargs["key"].stride(0) == 2 * 128 * 128
++        assert kwargs["key_dequant_scale"].stride(0) == 2 * 128
++        assert kwargs["weights"].dtype == torch.float32
++        assert kwargs["weights"].is_contiguous()
++        torch.testing.assert_close(kwargs["weights"], weights.float())
++        assert kwargs["metadata"] is metadata.schedule
++        assert kwargs["block_table"] is block_table
++        assert kwargs["quant_mode"] == kwargs["cmp_ratio"] == 1
++        assert kwargs["topk"] == 2048
++        assert kwargs["mask_mode"] == 3
++        assert kwargs["layout_q"] == "TND"
++        assert kwargs["layout_k"] == "PA_BBND"
++        assert "cmp_residual_k" not in kwargs
++        return output, torch.empty(0)
++
++    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2", compute, raising=False)
++    assert select_sfa_topk(q, key, weights, q_scale, key_scale, block_table, metadata) is output
++    torch.testing.assert_close(key.view(torch.uint8), before)
++
++
++def test_mxfp4_quantizer_keeps_packed_bytes_and_pair_scales():
++    class FakeNpu:
++        float4_e2m1fn_x2 = object()
++
++        @staticmethod
++        def npu_dynamic_mx_quant(x, *, dst_type, round_mode):
++            assert dst_type is FakeNpu.float4_e2m1fn_x2
++            assert round_mode == "round"
++            return torch.zeros((*x.shape[:-1], 64), dtype=torch.uint8), torch.zeros(
++                (*x.shape[:-1], 2, 2), dtype=torch.uint8
++            )
++
++    packed, scales = quantize_sfa_indexer_mxfp4(torch.randn(3, 1, 128), FakeNpu)
++    assert packed.shape == (3, 1, 64)
++    assert scales.shape == (3, 1, 2, 2)
++    assert packed.dtype == scales.dtype == torch.uint8
++
++
++def test_mxfp4_consumer_uses_mode5_and_cache_contract(metadata_calls, monkeypatch):
++    builder = SFAIndexerMetadataBuilder(1, 128, 2, torch.device("cpu"), quant_mode=QLI_V2_MXFP4)
++    metadata = builder.build(torch.tensor([2, 5]), torch.tensor([128, 256]))
++    assert metadata.quant_mode == QLI_V2_MXFP4
++    assert metadata_calls[-1]["quant_mode"] == QLI_V2_MXFP4
++
++    query = torch.zeros(2, 1, 64, dtype=torch.uint8)
++    key = torch.zeros(4, 128, 1, 64, dtype=torch.uint8)[::2]
++    query_scale = torch.zeros(2, 1, 2, 2, dtype=torch.uint8)
++    key_scale = torch.zeros(4, 128, 1, 4, dtype=torch.uint8)[::2]
++    weights = torch.ones(2, 1, dtype=torch.float32)
++    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
++    output = torch.empty(2, 1, 2048, dtype=torch.int32)
++
++    def compute(**kwargs):
++        assert kwargs["query"] is query
++        assert kwargs["key"] is key
++        assert kwargs["query_dequant_scale"] is query_scale
++        assert kwargs["key_dequant_scale"].shape == (2, 128, 1, 2, 2)
++        assert kwargs["key_dequant_scale"].stride(0) == key_scale.stride(0)
++        assert kwargs["weights"].dtype == torch.float32
++        assert kwargs["quant_mode"] == QLI_V2_MXFP4
++        assert kwargs["layout_q"] == "TND" and kwargs["layout_k"] == "PA_BBND"
++        return output, torch.empty(0)
++
++    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2", compute, raising=False)
++    assert select_sfa_topk(query, key, weights, query_scale, key_scale, block_table, metadata) is output
++
++
++def test_mxfp4_cache_scatter_contract_rejects_wrong_physical_width():
++    # Keep this test independent of Triton; the same shape is enforced by the
++    # registered op before launching the A5 kernel.
++    pytest.importorskip("vllm.triton_utils")
++    from vllm_ascend.ops.triton.sfa_indexer_cache import sfa_indexer_mxfp4_cache
++
++    with pytest.raises(ValueError, match="packed uint8 K"):
++        sfa_indexer_mxfp4_cache(
++            torch.zeros(1, 128, dtype=torch.uint8),
++            torch.zeros(1, 4, dtype=torch.uint8),
++            torch.zeros(1, 16, 1, 64, dtype=torch.uint8),
++            torch.zeros(1, 16, 1, 4, dtype=torch.uint8),
++            torch.zeros(1, dtype=torch.int32),
++        )
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index 90b5beec5..c327684cb 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -285,6 +285,12 @@ class AscendConfig:
+ 
+         self.enable_sparse_sfa_c8 = additional_config.get("enable_sparse_sfa_c8", False) and use_sparse
+         self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
++        self.sfa_indexer_quant_mode = additional_config.get("sfa_indexer_quant_mode", "fp8")
++        if self.sfa_indexer_quant_mode not in ("fp8", "mxfp4"):
++            raise ValueError(
++                "additional_config.sfa_indexer_quant_mode must be 'fp8' or 'mxfp4', "
++                f"got {self.sfa_indexer_quant_mode!r}."
++            )
+         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
+             "c8_enable_reshape_optim", False
+         )
+@@ -357,6 +363,29 @@ class AscendConfig:
+             additional_config.get("sparse_kv_offload_config", {}),
+         )
+         self._validate_sparse_c8_kv_offload_compatibility()
++        self._validate_sfa_indexer_quantization(vllm_config)
++
++    def _validate_sfa_indexer_quantization(self, vllm_config: "VllmConfig") -> None:
++        if self.sfa_indexer_quant_mode != "mxfp4":
++            return
++
++        from vllm.triton_utils import HAS_TRITON
++
++        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
++
++        if get_ascend_device_type() != AscendDeviceType.A5:
++            raise ValueError("sfa_indexer_quant_mode=mxfp4 requires Ascend A5.")
++        if vllm_config.model_config.hf_config.model_type != "glm_moe_dsa":
++            raise ValueError("MXFP4 SFA indexer requires the glm_moe_dsa SFA model path.")
++        if not self.enable_sparse_li_c8:
++            raise ValueError("sfa_indexer_quant_mode=mxfp4 requires enable_sparse_li_c8=true.")
++        if vllm_config.model_config.hf_text_config.index_head_dim != 128:
++            raise ValueError("MXFP4 SFA indexer requires logical index_head_dim=128.")
++        if not HAS_TRITON:
++            raise ValueError("MXFP4 SFA cache writes require triton-ascend.")
++        # The A5 StoreKVBlock path implements the existing C8 cache contract.
++        # Packed FP4 uses the byte-scatter kernel instead.
++        self.c8_enable_reshape_optim = False
+ 
+     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
+         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
+diff --git a/vllm_ascend/attention/sfa_indexer.py b/vllm_ascend/attention/sfa_indexer.py
+new file mode 100644
+index 000000000..71f0ee0fc
+--- /dev/null
++++ b/vllm_ascend/attention/sfa_indexer.py
+@@ -0,0 +1,146 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""QLI V2 contract for the uncompressed GLM SFA indexer on A5."""
++
++from dataclasses import dataclass
++
++import torch
++
++SFA_INDEXER_TOPK = 2048
++QLI_V2_FP8_PER_TOKEN = 1
++QLI_V2_MXFP4 = 5
++MXFP4_HEAD_DIM = 128
++MXFP4_PACKED_DIM = 64
++MXFP4_SCALE_DIM = 4
++QLI_V2_METADATA_SIZE = 1024
++
++
++@dataclass
++class SFAIndexerMetadata:
++    cu_seqlens_q: torch.Tensor
++    seqused_k: torch.Tensor
++    schedule: torch.Tensor
++    quant_mode: int = QLI_V2_FP8_PER_TOKEN
++
++
++class SFAIndexerMetadataBuilder:
++    def __init__(
++        self,
++        num_heads: int,
++        head_dim: int,
++        max_num_reqs: int,
++        device: torch.device,
++        quant_mode: int = QLI_V2_FP8_PER_TOKEN,
++    ):
++        if quant_mode not in (QLI_V2_FP8_PER_TOKEN, QLI_V2_MXFP4):
++            raise ValueError("SFA indexer supports QLI V2 FP8 (1) or MXFP4 (5).")
++        self.quant_mode = quant_mode
++        self.num_heads = num_heads
++        self.head_dim = head_dim
++        self.max_num_reqs = max_num_reqs
++        self.device = device
++        # Graph replay retains tensor addresses. Draft steps must not overwrite
++        # the main model's metadata or another draft step's metadata.
++        self._buffers: dict[int | None, SFAIndexerMetadata] = {}
++
++    def build(
++        self,
++        cumulative_query_lens: torch.Tensor,
++        seq_lens: torch.Tensor,
++        draft_index: int | None = None,
++    ) -> SFAIndexerMetadata:
++        num_reqs = cumulative_query_lens.numel()
++        if num_reqs != seq_lens.numel() or num_reqs > self.max_num_reqs:
++            raise ValueError("SFA QLI V2 requires matching Q/K request counts within the metadata buffer capacity.")
++        if draft_index not in self._buffers:
++            self._buffers[draft_index] = SFAIndexerMetadata(
++                cu_seqlens_q=torch.zeros(self.max_num_reqs + 1, dtype=torch.int32, device=self.device),
++                seqused_k=torch.empty(self.max_num_reqs, dtype=torch.int32, device=self.device),
++                schedule=torch.empty(QLI_V2_METADATA_SIZE, dtype=torch.int32, device=self.device),
++            )
++        buffers = self._buffers[draft_index]
++        cu_seqlens_q = buffers.cu_seqlens_q[: num_reqs + 1]
++        seqused_k = buffers.seqused_k[:num_reqs]
++        # Legacy SFA stores cumulative ends without the leading zero. V2
++        # requires B+1 entries. PA key lengths remain per-request lengths.
++        cu_seqlens_q[1:].copy_(cumulative_query_lens)
++        seqused_k.copy_(seq_lens)
++        schedule = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
++            num_heads_q=self.num_heads,
++            num_heads_k=1,
++            head_dim=self.head_dim,
++            topk=SFA_INDEXER_TOPK,
++            quant_mode=self.quant_mode,
++            cu_seqlens_q=cu_seqlens_q,
++            seqused_k=seqused_k,
++            batch_size=num_reqs,
++            max_seqlen_q=-1,
++            max_seqlen_k=-1,
++            layout_q="TND",
++            layout_k="PA_BBND",
++            mask_mode=3,
++            cmp_ratio=1,
++            device=str(self.device),
++        )
++        buffers.schedule.copy_(schedule)
++        return SFAIndexerMetadata(cu_seqlens_q, seqused_k, buffers.schedule, self.quant_mode)
++
++
++def select_sfa_topk(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    weights: torch.Tensor,
++    query_scale: torch.Tensor,
++    key_scale: torch.Tensor,
++    block_table: torch.Tensor,
++    metadata: SFAIndexerMetadata,
++) -> torch.Tensor:
++    if metadata.quant_mode == QLI_V2_MXFP4:
++        if query.shape[-1] != MXFP4_PACKED_DIM or key.shape[-1] != MXFP4_PACKED_DIM:
++            raise ValueError("MXFP4 Q/K must store logical D128 in 64 packed bytes.")
++        if key_scale.shape[-1] != MXFP4_SCALE_DIM or key_scale.dim() != 4:
++            raise ValueError("MXFP4 K scale cache must have shape [blocks, block_size, 1, 4].")
++        # Storage stays uint8 throughout gather/scatter. The C++ mode-5
++        # wrapper supplies ACL E8M0 / FP4 descriptors without numerical casts.
++        key_scale = key_scale.unflatten(-1, (2, 2))
++    # V2 accepts axis-0 cache strides. Do not copy/repack the full cache.
++    indices, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
++        query=query,
++        key=key,
++        weights=weights.float().contiguous(),
++        query_dequant_scale=query_scale,
++        key_dequant_scale=key_scale,
++        topk=SFA_INDEXER_TOPK,
++        quant_mode=metadata.quant_mode,
++        cu_seqlens_q=metadata.cu_seqlens_q,
++        seqused_k=metadata.seqused_k,
++        block_table=block_table,
++        metadata=metadata.schedule,
++        layout_q="TND",
++        layout_k="PA_BBND",
++        mask_mode=3,
++        cmp_ratio=1,
++        return_value=0,
++    )
++    return indices
++
++
++def quantize_sfa_indexer_mxfp4(x: torch.Tensor, npu_ops) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-32 E2M1/E8M0 quantization; keep physical storage as uint8.
++
++    Q and K use exactly the same quantizer and default rounding/scale algorithm.
++    This function runs after the existing rotary/Hadamard transform.
++    """
++    if x.shape[-1] != MXFP4_HEAD_DIM:
++        raise ValueError("MXFP4 SFA indexer requires logical head dimension 128.")
++    packed, scale = npu_ops.npu_dynamic_mx_quant(
++        x.contiguous(), dst_type=npu_ops.float4_e2m1fn_x2, round_mode="round"
++    )
++    packed = packed.view(torch.uint8)
++    scale = scale.view(torch.uint8)
++    if packed.shape != (*x.shape[:-1], MXFP4_PACKED_DIM):
++        raise ValueError("npu_dynamic_mx_quant must return packed FP4 with half the logical head width.")
++    if scale.shape != (*x.shape[:-1], 2, 2):
++        raise ValueError("npu_dynamic_mx_quant must return per-32 E8M0 scale pairs [..., 2, 2].")
++    return packed, scale
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index e55473754..49113c2ba 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -26,6 +26,13 @@ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.mla_v1 import MLAPO_MAX_SUPPORTED_TOKENS
++from vllm_ascend.attention.sfa_indexer import (
++    QLI_V2_FP8_PER_TOKEN,
++    QLI_V2_MXFP4,
++    SFAIndexerMetadata,
++    SFAIndexerMetadataBuilder,
++    quantize_sfa_indexer_mxfp4,
++)
+ from vllm_ascend.attention.utils import (
+     SFA_QSFA_TILE_SIZE,
+     AscendCommonAttentionMetadata,
+@@ -70,6 +77,9 @@ from vllm_ascend.utils import (
+ )
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ 
++if HAS_TRITON:
++    import vllm_ascend.ops.triton.sfa_indexer_cache  # noqa: F401
++
+ if TYPE_CHECKING:
+     from vllm.v1.core.sched.output import SchedulerOutput
+ 
+@@ -212,6 +222,7 @@ class AscendSFAMetadata:
+     group_len: torch.Tensor | None = None
+     group_key_idx: torch.Tensor | None = None
+     group_key_cache_idx: torch.Tensor | None = None
++    qli_v2: SFAIndexerMetadata | None = None
+     # Request identity for the Sparse KV offload resident LRU; only populated
+     # by AscendSFAKVOffloadMetadataBuilder.
+     req_ids_tensor: torch.Tensor | None = None
+@@ -278,6 +289,22 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
+         self.enable_dsa_cp = enable_dsa_cp()
++        self.qli_v2_builder: SFAIndexerMetadataBuilder | None = None
++        hf_config = self.model_config.hf_config
++        if (
++            hf_config.model_type == "glm_moe_dsa"
++            and get_ascend_config().enable_sparse_li_c8
++            and get_ascend_device_type() == AscendDeviceType.A5
++        ):
++            self.qli_v2_builder = SFAIndexerMetadataBuilder(
++                hf_config.index_n_heads,
++                hf_config.index_head_dim,
++                vllm_config.scheduler_config.max_num_seqs * self.decode_threshold,
++                self.device,
++                quant_mode=(
++                    QLI_V2_MXFP4 if get_ascend_config().sfa_indexer_quant_mode == "mxfp4" else QLI_V2_FP8_PER_TOKEN
++                ),
++            )
+ 
+     @staticmethod
+     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
+@@ -466,6 +493,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+                 block_size,
+             )
+ 
++        qli_v2 = None
++        if self.qli_v2_builder is not None:
++            # DSA-CP uses rank-local cumulative Q ends and effective causal K
++            # lengths. Build the schedule from the same view as the consumer.
++            qli_v2 = self.qli_v2_builder.build(
++                dsa_cp_context.actual_seq_lengths_query if dsa_cp_context is not None else cum_query_lens,
++                dsa_cp_context.actual_seq_lengths_key if dsa_cp_context is not None else seq_lens,
++                draft_index,
++            )
++
+         return self.metadata_cls(  # type: ignore
+             num_input_tokens=common_attn_metadata.num_input_tokens,
+             num_actual_tokens=num_actual_tokens,
+@@ -484,6 +521,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+             group_len=common_attn_metadata.group_len,
+             group_key_idx=common_attn_metadata.group_key_idx,
+             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
++            qli_v2=qli_v2,
+         )
+ 
+     def build_for_graph_capture(
+@@ -617,6 +655,7 @@ class AscendSFAImpl(MLAAttentionImpl):
+         # - C8 indexer cache for lightning indexer.
+         # The user-facing switches control these layouts independently. LI C8
+         # applies only to layers that own an indexer cache.
++        self.indexer_quant_mode = ascend_config.sfa_indexer_quant_mode
+         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
+         self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.indexer.k_cache.prefix)
+         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+@@ -1432,9 +1471,16 @@ class AscendSFAImpl(MLAAttentionImpl):
+ 
+         if self.enable_sparse_li_c8:
+             k_li = k_li @ AscendSFAImpl.k_hadamard
+-            k_li, k_li_scale = torch_npu.npu_dynamic_quant(k_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
+-            k_li_scale = k_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+-            k_li_scale = k_li_scale.unsqueeze(-1)  # [b*s,1]
++            if self.indexer_quant_mode == "mxfp4":
++                k_li, k_li_scale = quantize_sfa_indexer_mxfp4(k_li, torch_npu)
++                k_li = k_li.flatten(1)
++                k_li_scale = k_li_scale.flatten(1)
++            else:
++                k_li, k_li_scale = torch_npu.npu_dynamic_quant(
++                    k_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype
++                )
++                k_li_scale = k_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
++                k_li_scale = k_li_scale.unsqueeze(-1)  # [b*s,1]
+         else:
+             k_li_scale = None
+ 
+@@ -1507,8 +1553,13 @@ class AscendSFAImpl(MLAAttentionImpl):
+         if self.enable_sparse_li_c8:
+             q_li_shape_ori = q_li.shape
+             q_li = q_li @ AscendSFAImpl.q_hadamard
+-            q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
+-            q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
++            if self.indexer_quant_mode == "mxfp4":
++                q_li, q_li_scale = quantize_sfa_indexer_mxfp4(q_li, torch_npu)
++            else:
++                q_li, q_li_scale = torch_npu.npu_dynamic_quant(
++                    q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype
++                )
++                q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+ 
+         return DeviceOperator.indexer_select_post_process(
+             self,
+@@ -1816,6 +1867,63 @@ class AscendSFAImpl(MLAAttentionImpl):
+             )
+         return (*main_cache, *indexer_cache)
+ 
++    def _write_indexer_cache(
++        self,
++        k_li: torch.Tensor,
++        k_li_scale: torch.Tensor | None,
++        slot_mapping: torch.Tensor,
++        kv_cache: tuple,
++        attn_metadata: M,
++    ) -> None:
++        dsa_k_cache_idx = self.kv_cache_indexer_k_idx
++        dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
++
++        if self.enable_sparse_li_c8 and self.indexer_quant_mode == "mxfp4":
++            assert k_li_scale is not None
++            torch.ops.vllm.sfa_indexer_mxfp4_cache(
++                k_li,
++                k_li_scale,
++                kv_cache[dsa_k_cache_idx],
++                kv_cache[dsa_k_scale_cache_idx],
++                slot_mapping.view(-1),
++            )
++            return
++
++        use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
++        if use_li_c8_reshape_optim:
++            torch.ops._C_ascend.store_kv_block(
++                k_li,
++                kv_cache[dsa_k_cache_idx],
++                attn_metadata.group_len,
++                attn_metadata.group_key_idx,
++                attn_metadata.group_key_cache_idx,
++                attn_metadata.block_size,
++            )
++        else:
++            torch_npu.npu_scatter_nd_update_(
++                kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
++                slot_mapping.view(-1, 1),
++                k_li.view(-1, k_li.shape[-1]),
++            )  # b, s, n, d
++        if self.enable_sparse_li_c8:
++            assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
++            assert k_li_scale is not None
++            if use_li_c8_reshape_optim:
++                torch.ops._C_ascend.store_kv_block(
++                    k_li_scale,
++                    kv_cache[dsa_k_scale_cache_idx],
++                    attn_metadata.group_len,
++                    attn_metadata.group_key_idx,
++                    attn_metadata.group_key_cache_idx,
++                    attn_metadata.block_size,
++                )
++            else:
++                torch_npu.npu_scatter_nd_update_(
++                    kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
++                    slot_mapping.view(-1, 1),
++                    k_li_scale.view(-1, k_li_scale.shape[-1]),
++                )
++
+     def forward(
+         self,
+         layer_name,
+@@ -1980,43 +2088,7 @@ class AscendSFAImpl(MLAAttentionImpl):
+ 
+         if kv_cache is not None and self.has_indexer:
+             assert k_li is not None
+-            use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
+-            dsa_k_cache_idx = self.kv_cache_indexer_k_idx
+-            dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
+-
+-            if use_li_c8_reshape_optim:
+-                torch.ops._C_ascend.store_kv_block(
+-                    k_li,
+-                    kv_cache[dsa_k_cache_idx],
+-                    attn_metadata.group_len,
+-                    attn_metadata.group_key_idx,
+-                    attn_metadata.group_key_cache_idx,
+-                    attn_metadata.block_size,
+-                )
+-            else:
+-                torch_npu.npu_scatter_nd_update_(
+-                    kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
+-                    slot_mapping.view(-1, 1),
+-                    k_li.view(-1, k_li.shape[-1]),
+-                )  # b, s, n, d
+-            if self.enable_sparse_li_c8:
+-                assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
+-                if k_li_scale is not None:
+-                    if use_li_c8_reshape_optim:
+-                        torch.ops._C_ascend.store_kv_block(
+-                            k_li_scale,
+-                            kv_cache[dsa_k_scale_cache_idx],
+-                            attn_metadata.group_len,
+-                            attn_metadata.group_key_idx,
+-                            attn_metadata.group_key_cache_idx,
+-                            attn_metadata.block_size,
+-                        )
+-                    else:
+-                        torch_npu.npu_scatter_nd_update_(
+-                            kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
+-                            slot_mapping.view(-1, 1),
+-                            k_li_scale.view(-1, k_li_scale.shape[-1]),
+-                        )
++            self._write_indexer_cache(k_li, k_li_scale, slot_mapping, kv_cache, attn_metadata)
+         # Notify for every layer that wrote the cache, not just indexer layers:
+         # by this point all of the layer's KV (main + indexer) has been
+         # scattered, so the connector can dispatch the PD pull immediately.
+diff --git a/vllm_ascend/core/kv_cache_interface.py b/vllm_ascend/core/kv_cache_interface.py
+index b5f63a549..a13ca6477 100644
+--- a/vllm_ascend/core/kv_cache_interface.py
++++ b/vllm_ascend/core/kv_cache_interface.py
+@@ -112,9 +112,24 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
+     scale_dim: int = 0
+     scale_dtype: torch.dtype = torch.int8
+     cache_sparse_li_c8: bool = False
++    indexer_quant_mode: str = "fp8"
+     cache_dtype_str: str | None = None
+     sfa_dcp_replicated_indexer_size: int = 1
+ 
++    @property
++    def storage_head_size(self) -> int:
++        """Physical elements per K row; head_size remains the logical dimension."""
++        if self.indexer_quant_mode == "mxfp4":
++            if (
++                self.head_size != 128
++                or self.dtype != torch.uint8
++                or self.scale_dim != 4
++                or self.scale_dtype != torch.uint8
++            ):
++                raise ValueError("MXFP4 indexer cache requires D128, packed uint8 K and four E8M0 bytes per row.")
++            return self.head_size // 2
++        return self.head_size
++
+     @property
+     def page_size_bytes(self) -> int:
+         return self.real_page_size_bytes
+@@ -125,7 +140,7 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
+         return (
+             self.sfa_dcp_replicated_indexer_size
+             * num_heads_per_page
+-            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
++            * (self.storage_head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+         )
+ 
+     @classmethod
+@@ -138,6 +153,8 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
+         scale_dim_set = set(spec.scale_dim for spec in specs)
+         scale_dtype_set = set(spec.scale_dtype for spec in specs)
+         cache_sparse_li_c8_set = set(spec.cache_sparse_li_c8 for spec in specs)
++        indexer_quant_modes = {spec.indexer_quant_mode for spec in specs}
++        head_sizes = {spec.head_size for spec in specs}
+         sfa_dcp_replicated_indexer_size_set = set(spec.sfa_dcp_replicated_indexer_size for spec in specs)
+         assert (
+             len(cache_dtype_str_set) == 1
+@@ -145,6 +162,8 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
+             and len(scale_dim_set) == 1
+             and len(scale_dtype_set) == 1
+             and len(cache_sparse_li_c8_set) == 1
++            and len(indexer_quant_modes) == 1
++            and len(head_sizes) == 1
+             and len(sfa_dcp_replicated_indexer_size_set) == 1
+         ), (
+             "All SFA indexer cache layers in the same KV cache group must use "
+@@ -160,6 +179,7 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
+             scale_dim=scale_dim_set.pop(),
+             scale_dtype=scale_dtype_set.pop(),
+             cache_sparse_li_c8=cache_sparse_li_c8_set.pop(),
++            indexer_quant_mode=indexer_quant_modes.pop(),
+             sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
+         )
+ 
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index 03105c4a2..9ccffd73f 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -23,6 +23,7 @@ import torch.nn.functional as F
+ import torch_npu
+ from vllm.triton_utils import HAS_TRITON
+ 
++from vllm_ascend.attention.sfa_indexer import select_sfa_topk
+ from vllm_ascend.device import utils as device_utils
+ from vllm_ascend.device.mxfp_compat import (
+     FLOAT8_E8M0FNU_DTYPE,
+@@ -1717,9 +1718,34 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+             assert q_li_shape_ori is not None
+ 
+             if q_li_scale is not None:
++                if getattr(sfa_impl, "indexer_quant_mode", "fp8") == "mxfp4":
++                    if attn_metadata.qli_v2 is None or attn_metadata.qli_v2.quant_mode != 5:
++                        raise RuntimeError("MXFP4 indexer requires matching QLI V2 mode-5 metadata.")
++                    return select_sfa_topk(
++                        query=q_li,
++                        key=kv_cache[indexer_cache_idx],
++                        weights=weights,
++                        query_scale=q_li_scale,
++                        key_scale=kv_cache[indexer_scale_cache_idx],
++                        block_table=attn_metadata.block_table,
++                        metadata=attn_metadata.qli_v2,
++                    )
+                 q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
+                 key_dequant_scale = kv_cache[indexer_scale_cache_idx].squeeze(2)
+ 
++                if use_torch_npu_lightning_indexer:
++                    if attn_metadata.qli_v2 is None:
++                        raise RuntimeError("A5 GLM FP8 indexer requires QLI V2 metadata from the SFA builder.")
++                    return select_sfa_topk(
++                        query=q_li.view(q_li_shape_ori),
++                        key=kv_cache[indexer_cache_idx],
++                        weights=weights,
++                        query_scale=q_li_scale,
++                        key_scale=key_dequant_scale,
++                        block_table=attn_metadata.block_table,
++                        metadata=attn_metadata.qli_v2,
++                    )
++
+                 topk_indices = torch_npu.npu_quant_lightning_indexer(
+                     query=q_li.view(q_li_shape_ori),
+                     key=kv_cache[indexer_cache_idx],
+diff --git a/vllm_ascend/ops/triton/sfa_indexer_cache.py b/vllm_ascend/ops/triton/sfa_indexer_cache.py
+new file mode 100644
+index 000000000..048f3111d
+--- /dev/null
++++ b/vllm_ascend/ops/triton/sfa_indexer_cache.py
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Scatter already-quantized MXFP4 payload/scales without interpreting bytes."""
++
++import torch
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++
++@triton.jit
++def _scatter_indexer_bytes(
++    key,
++    scales,
++    key_cache,
++    scale_cache,
++    slots,
++    KEY_ROW_STRIDE: tl.constexpr,
++    SCALE_ROW_STRIDE: tl.constexpr,
++    KEY_BLOCK_STRIDE: tl.constexpr,
++    SCALE_BLOCK_STRIDE: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    NUM_BLOCKS: tl.constexpr,
++):
++    token = tl.program_id(0)
++    slot = tl.load(slots + token).to(tl.int64)
++    # Padded graph tokens have slot=-1.  Use masks instead of a runtime
++    # Python branch: Triton only permits compile-time branches in kernels.
++    valid = (slot >= 0) & (slot < NUM_BLOCKS * BLOCK_SIZE)
++    block = slot // BLOCK_SIZE
++    row = slot % BLOCK_SIZE
++    d = tl.arange(0, 64)
++    payload = tl.load(key + token * KEY_ROW_STRIDE + d, mask=valid, other=0)
++    tl.store(key_cache + block * KEY_BLOCK_STRIDE + row * 64 + d, payload, mask=valid)
++    s = tl.arange(0, 4)
++    exponents = tl.load(scales + token * SCALE_ROW_STRIDE + s, mask=valid, other=0)
++    tl.store(scale_cache + block * SCALE_BLOCK_STRIDE + row * 4 + s, exponents, mask=valid)
++
++
++def sfa_indexer_mxfp4_cache(
++    key: torch.Tensor,
++    scales: torch.Tensor,
++    key_cache: torch.Tensor,
++    scale_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++) -> None:
++    if key.dtype != torch.uint8 or scales.dtype != torch.uint8:
++        raise ValueError("MXFP4 scatter requires packed uint8 K and E8M0 byte scales.")
++    if key_cache.dtype != torch.uint8 or scale_cache.dtype != torch.uint8:
++        raise ValueError("MXFP4 caches must use byte storage.")
++    if key.dim() != 2 or key.shape[1] != 64 or scales.shape != (key.shape[0], 4):
++        raise ValueError("MXFP4 scatter expects K [tokens,64] and scales [tokens,4].")
++    if key_cache.dim() != 4 or key_cache.shape[2:] != (1, 64):
++        raise ValueError("MXFP4 K cache must be [blocks,block_size,1,64].")
++    if scale_cache.shape != (*key_cache.shape[:2], 1, 4):
++        raise ValueError("MXFP4 scale cache must be [blocks,block_size,1,4].")
++    if key.stride(-1) != 1 or scales.stride(-1) != 1:
++        raise ValueError("MXFP4 scatter input rows must be contiguous.")
++    if key_cache.stride(1) != 64 or scale_cache.stride(1) != 4:
++        raise ValueError("MXFP4 cache inner rows must be contiguous; only block padding is supported.")
++    if key_cache.stride(-1) != 1 or scale_cache.stride(-1) != 1:
++        raise ValueError("MXFP4 cache byte axis must be contiguous.")
++    if slot_mapping.numel() != key.shape[0] or slot_mapping.dtype not in (torch.int32, torch.int64):
++        raise ValueError("MXFP4 scatter needs one integer slot per input token.")
++    if key.shape[0] == 0:
++        return
++    _scatter_indexer_bytes[(key.shape[0],)](
++        key,
++        scales,
++        key_cache,
++        scale_cache,
++        slot_mapping.contiguous(),
++        key.stride(0),
++        scales.stride(0),
++        key_cache.stride(0),
++        scale_cache.stride(0),
++        key_cache.shape[1],
++        key_cache.shape[0],
++    )
++
++
++def _fake_sfa_indexer_mxfp4_cache(
++    key: torch.Tensor,
++    scales: torch.Tensor,
++    key_cache: torch.Tensor,
++    scale_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++) -> None:
++    return
++
++
++direct_register_custom_op(
++    op_name="sfa_indexer_mxfp4_cache",
++    op_func=sfa_indexer_mxfp4_cache,
++    fake_impl=_fake_sfa_indexer_mxfp4_cache,
++    mutates_args=["key_cache", "scale_cache"],
++    dispatch_key="PrivateUse1",
++)
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index fd5463845..26a0575a1 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -4119,7 +4119,7 @@ class NPUModelRunner(GPUModelRunner):
+                         * current_kv_cache_spec.sfa_dcp_replicated_indexer_size
+                         * current_kv_cache_spec.block_size
+                         * current_kv_cache_spec.num_kv_heads
+-                        * current_kv_cache_spec.head_size
++                        * current_kv_cache_spec.storage_head_size
+                         * get_dtype_size(current_kv_cache_spec.dtype)
+                     )
+                     if current_kv_cache_spec.scale_dim:
+@@ -4359,7 +4359,7 @@ class NPUModelRunner(GPUModelRunner):
+                         num_blocks * current_kv_cache_spec.sfa_dcp_replicated_indexer_size,
+                         current_kv_cache_spec.block_size,
+                         current_kv_cache_spec.num_kv_heads,
+-                        current_kv_cache_spec.head_size,
++                        current_kv_cache_spec.storage_head_size,
+                     )
+                     indexer_k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(kv_cache_shape)
+                     if raw_scale_tensor is None:
+@@ -4888,14 +4888,24 @@ class NPUModelRunner(GPUModelRunner):
+                 # Remove this special case once the generic vLLM spec/backend
+                 # path can describe the Ascend SFA indexer layout directly.
+                 cache_sparse_li_c8 = self.ascend_config.is_sparse_li_c8_layer(layer_name)
++                indexer_mxfp4 = cache_sparse_li_c8 and self.ascend_config.sfa_indexer_quant_mode == "mxfp4"
+                 kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
+                     block_size=self.block_size,
+                     num_kv_heads=1,
+                     head_size=self.model_config.hf_text_config.index_head_dim,
+-                    dtype=self.c8_k_cache_dtype if cache_sparse_li_c8 else self.kv_cache_dtype,
++                    dtype=(
++                        torch.uint8
++                        if indexer_mxfp4
++                        else (self.c8_k_cache_dtype if cache_sparse_li_c8 else self.kv_cache_dtype)
++                    ),
+                     cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+-                    scale_dim=1 if cache_sparse_li_c8 else 0,
+-                    scale_dtype=self.c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8,
++                    scale_dim=4 if indexer_mxfp4 else (1 if cache_sparse_li_c8 else 0),
++                    scale_dtype=(
++                        torch.uint8
++                        if indexer_mxfp4
++                        else (self.c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8)
++                    ),
++                    indexer_quant_mode="mxfp4" if indexer_mxfp4 else "fp8",
+                     cache_sparse_li_c8=cache_sparse_li_c8,
+                     sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
+                 )

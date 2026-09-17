@@ -1,45 +1,112 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Clone this patched vLLM-Ascend tree, rebuild its extension in the current A5
-# container, and run the focused QLI V2/MXFP4 contract tests.
-#
-# Optional overrides:
-#   VA_REPO, VA_REF, VA_WORKDIR, SOC_VERSION
+# Install the GLM SFA QLI V2 MXFP4 framework integration without modifying the
+# vLLM-Ascend source tree baked into the container. The script checks out the
+# exact deployment baseline in a separate directory, verifies the patch in full,
+# applies it atomically, and installs that checkout in editable mode.
 
-VA_REPO="${VA_REPO:-https://github.com/Qiming-zhang-rondo/vllm-ascend-glm-mxfp4.git}"
-VA_REF="${VA_REF:-main}"
-VA_WORKDIR="${VA_WORKDIR:-/workspace/vllm-ascend-glm-mxfp4}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PATCH_FILE="${QLI_PATCH_FILE:-$SCRIPT_DIR/../patches/v0.26.0-8bfdcf2fe931/qli-indexer-mxfp4.patch}"
+VA_UPSTREAM_REPO="${VA_UPSTREAM_REPO:-https://github.com/vllm-project/vllm-ascend.git}"
+VA_BASE_REF="${VA_BASE_REF:-v0.26.0 deployment baseline}"
+VA_BASE_COMMIT="${VA_BASE_COMMIT:-8bfdcf2fe931f7d535e0e67a4e4eba233bccb598}"
+VA_WORKDIR="${VA_WORKDIR:-/workspace/vllm-ascend-qli-mxfp4-v0.26.0}"
 export SOC_VERSION="${SOC_VERSION:-ascend950dt_9582}"
+
+update=0
+check_only=0
+while (($#)); do
+    case "$1" in
+        --update) update=1 ;;
+        --check-only) check_only=1 ;;
+        -h|--help)
+            cat <<EOF
+Usage: bash tools/install_glm_mxfp4_a5.sh [--update] [--check-only]
+
+  --update      move an existing work directory aside and recreate it
+  --check-only  verify the exact base and patch applicability; do not install
+
+Environment overrides: VA_UPSTREAM_REPO, VA_BASE_REF, VA_BASE_COMMIT,
+VA_WORKDIR, QLI_PATCH_FILE, SOC_VERSION.
+EOF
+            exit 0
+            ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
 
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
-
-if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
-    # shellcheck disable=SC1091
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-fi
-if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
-    # shellcheck disable=SC1091
-    source /usr/local/Ascend/nnal/atb/set_env.sh
-fi
+test -s "$PATCH_FILE" || { echo "QLI patch not found: $PATCH_FILE" >&2; exit 1; }
 
 case "$SOC_VERSION" in
     *950*) ;;
     *) echo "SOC_VERSION=$SOC_VERSION does not identify an Ascend 950/A5 target" >&2; exit 2 ;;
 esac
 
-if [ -e "$VA_WORKDIR" ]; then
+if [[ -e "$VA_WORKDIR" && "$update" -eq 1 ]]; then
     backup_path="${VA_WORKDIR}.backup.$(date +%Y%m%d%H%M%S)"
-    echo "Moving the previous checkout to $backup_path"
+    echo "Moving previous patched checkout to $backup_path"
     mv "$VA_WORKDIR" "$backup_path"
 fi
 
-git clone --depth 1 --branch "$VA_REF" "$VA_REPO" "$VA_WORKDIR"
-git -C "$VA_WORKDIR" diff --check
+if [[ ! -d "$VA_WORKDIR/.git" ]]; then
+    [[ ! -e "$VA_WORKDIR" ]] || {
+        echo "$VA_WORKDIR exists but is not a Git checkout; use another VA_WORKDIR or move it aside" >&2
+        exit 1
+    }
+    mkdir -p "$VA_WORKDIR"
+    git -C "$VA_WORKDIR" init -q
+    git -C "$VA_WORKDIR" remote add origin "$VA_UPSTREAM_REPO"
+    echo "Fetching vLLM-Ascend $VA_BASE_REF at $VA_BASE_COMMIT"
+    git -C "$VA_WORKDIR" fetch --depth 1 origin "$VA_BASE_COMMIT"
+    git -C "$VA_WORKDIR" checkout -q --detach FETCH_HEAD
+fi
 
-# The editable install rebuilds _C_ascend and makes the active interpreter use
-# this checkout instead of the vllm-ascend copy baked into the container.
+actual_commit="$(git -C "$VA_WORKDIR" rev-parse HEAD)"
+if [[ "$actual_commit" != "$VA_BASE_COMMIT" ]]; then
+    echo "Refusing to patch unexpected vLLM-Ascend base." >&2
+    echo "Expected: $VA_BASE_COMMIT ($VA_BASE_REF)" >&2
+    echo "Actual:   $actual_commit" >&2
+    echo "Use --update to recreate the isolated checkout." >&2
+    exit 3
+fi
+
+if git -C "$VA_WORKDIR" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
+    echo "QLI MXFP4 patch is already applied."
+else
+    if [[ -n "$(git -C "$VA_WORKDIR" status --porcelain)" ]]; then
+        echo "Refusing to patch a modified worktree: $VA_WORKDIR" >&2
+        git -C "$VA_WORKDIR" status --short >&2
+        exit 3
+    fi
+    git -C "$VA_WORKDIR" apply --check "$PATCH_FILE"
+    if [[ "$check_only" -eq 1 ]]; then
+        echo "Patch preflight passed for $VA_BASE_COMMIT; no files changed."
+        exit 0
+    fi
+    git -C "$VA_WORKDIR" apply "$PATCH_FILE"
+    git -C "$VA_WORKDIR" diff --check
+    echo "Applied QLI MXFP4 patch to isolated vLLM-Ascend checkout."
+fi
+
+if [[ "$check_only" -eq 1 ]]; then
+    echo "Patched checkout verified; installation skipped."
+    exit 0
+fi
+
+if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
+    # shellcheck disable=SC1091
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
+    # shellcheck disable=SC1091
+    source /usr/local/Ascend/nnal/atb/set_env.sh
+fi
+
+echo "Installing patched vLLM-Ascend from $VA_WORKDIR"
 python3 -m pip install --no-deps -e "$VA_WORKDIR"
 
 python3 - <<'PY'
@@ -60,21 +127,15 @@ required = {
     "npu_dynamic_mx_quant": hasattr(torch_npu, "npu_dynamic_mx_quant"),
 }
 print("vllm_ascend:", vllm_ascend.__file__)
-print("torch:", torch.__version__)
-print("torch_npu:", torch_npu.__version__)
 for name, available in required.items():
     print(f"{name}: {available}")
 if not all(required.values()):
     missing = ", ".join(name for name, available in required.items() if not available)
-    raise RuntimeError(f"A5 runtime is missing required MXFP4 indexer operators: {missing}")
+    raise RuntimeError(f"A5 runtime is missing required MXFP4 indexer APIs: {missing}")
 PY
 
-cd "$VA_WORKDIR"
-python3 -m pytest -q tests/ut/attention/test_sfa_indexer.py
-python3 -m pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_sfa_indexer_qli_v2.py
-
 cat <<'EOF'
-Installation and focused A5 QLI V2/MXFP4 checks passed.
+QLI V2/MXFP4 framework patch and capability smoke check passed.
 
 Add this to the GLM-5.2/5.3 serve command:
   --additional-config '{"enable_sparse_li_c8":true,"sfa_indexer_quant_mode":"mxfp4"}'
