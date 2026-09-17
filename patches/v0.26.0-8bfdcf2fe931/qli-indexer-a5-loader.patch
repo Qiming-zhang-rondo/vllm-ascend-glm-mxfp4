@@ -1,0 +1,37 @@
+diff --git a/vllm_ascend/attention/sfa_indexer.py b/vllm_ascend/attention/sfa_indexer.py
+index 71f0ee0fc..b332f8b70 100644
+--- a/vllm_ascend/attention/sfa_indexer.py
++++ b/vllm_ascend/attention/sfa_indexer.py
+@@ -16,6 +16,16 @@ MXFP4_SCALE_DIM = 4
+ QLI_V2_METADATA_SIZE = 1024
+ 
+ 
++def _ensure_qli_v2_registered() -> None:
++    """Load only the compiled wrapper needed by A5 SFA.
++
++    vLLM-Ascend 0.26 disables the broad ``enable_custom_op`` path on A5.
++    QLI V2 is supported there, so load its registration library lazily at the
++    two call sites, following the A5 MLA prolog path.
++    """
++    import vllm_ascend.vllm_ascend_C  # noqa: F401, PLC0415
++
++
+ @dataclass
+ class SFAIndexerMetadata:
+     cu_seqlens_q: torch.Tensor
+@@ -50,6 +60,7 @@ class SFAIndexerMetadataBuilder:
+         seq_lens: torch.Tensor,
+         draft_index: int | None = None,
+     ) -> SFAIndexerMetadata:
++        _ensure_qli_v2_registered()
+         num_reqs = cumulative_query_lens.numel()
+         if num_reqs != seq_lens.numel() or num_reqs > self.max_num_reqs:
+             raise ValueError("SFA QLI V2 requires matching Q/K request counts within the metadata buffer capacity.")
+@@ -96,6 +107,7 @@ def select_sfa_topk(
+     block_table: torch.Tensor,
+     metadata: SFAIndexerMetadata,
+ ) -> torch.Tensor:
++    _ensure_qli_v2_registered()
+     if metadata.quant_mode == QLI_V2_MXFP4:
+         if query.shape[-1] != MXFP4_PACKED_DIM or key.shape[-1] != MXFP4_PACKED_DIM:
+             raise ValueError("MXFP4 Q/K must store logical D128 in 64 packed bytes.")

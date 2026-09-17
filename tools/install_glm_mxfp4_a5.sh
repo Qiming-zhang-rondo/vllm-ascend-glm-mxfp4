@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILE="${QLI_PATCH_FILE:-$SCRIPT_DIR/../patches/v0.26.0-8bfdcf2fe931/qli-indexer-mxfp4.patch}"
+LOADER_PATCH_FILE="${QLI_LOADER_PATCH_FILE:-$SCRIPT_DIR/../patches/v0.26.0-8bfdcf2fe931/qli-indexer-a5-loader.patch}"
 VA_UPSTREAM_REPO="${VA_UPSTREAM_REPO:-https://github.com/vllm-project/vllm-ascend.git}"
 VA_BASE_REF="${VA_BASE_REF:-v0.26.0 deployment baseline}"
 VA_BASE_COMMIT="${VA_BASE_COMMIT:-8bfdcf2fe931f7d535e0e67a4e4eba233bccb598}"
@@ -45,7 +46,7 @@ Usage: bash tools/install_glm_mxfp4_a5.sh [--update] [--check-only]
   --check-only  verify the exact base and patch applicability; do not install
 
 Environment overrides: VA_UPSTREAM_REPO, VA_BASE_REF, VA_BASE_COMMIT,
-VA_WORKDIR, QLI_PATCH_FILE, SOC_VERSION.
+VA_WORKDIR, QLI_PATCH_FILE, QLI_LOADER_PATCH_FILE, SOC_VERSION.
 EOF
             exit 0
             ;;
@@ -57,6 +58,7 @@ done
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 test -s "$PATCH_FILE" || { echo "QLI patch not found: $PATCH_FILE" >&2; exit 1; }
+test -s "$LOADER_PATCH_FILE" || { echo "QLI A5 loader patch not found: $LOADER_PATCH_FILE" >&2; exit 1; }
 
 case "$SOC_VERSION" in
     *950*) ;;
@@ -91,7 +93,7 @@ if [[ "$actual_commit" != "$VA_BASE_COMMIT" ]]; then
     exit 3
 fi
 
-if git -C "$VA_WORKDIR" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
+if grep -q '^QLI_V2_MXFP4 = 5$' "$VA_WORKDIR/vllm_ascend/attention/sfa_indexer.py" 2>/dev/null; then
     echo "QLI MXFP4 patch is already applied."
 else
     if [[ -n "$(git -C "$VA_WORKDIR" status --porcelain)" ]]; then
@@ -107,6 +109,19 @@ else
     git -C "$VA_WORKDIR" apply "$PATCH_FILE"
     git -C "$VA_WORKDIR" diff --check
     echo "Applied QLI MXFP4 patch to isolated vLLM-Ascend checkout."
+fi
+
+if git -C "$VA_WORKDIR" apply --reverse --check "$LOADER_PATCH_FILE" >/dev/null 2>&1; then
+    echo "A5 QLI V2 lazy-loader patch is already applied."
+else
+    git -C "$VA_WORKDIR" apply --check "$LOADER_PATCH_FILE"
+    if [[ "$check_only" -eq 1 ]]; then
+        echo "A5 QLI V2 lazy-loader patch preflight passed; no files changed."
+        exit 0
+    fi
+    git -C "$VA_WORKDIR" apply "$LOADER_PATCH_FILE"
+    git -C "$VA_WORKDIR" diff --check
+    echo "Applied A5 QLI V2 lazy-loader patch; no native rebuild is required."
 fi
 
 if [[ "$check_only" -eq 1 ]]; then
@@ -136,8 +151,6 @@ import torch
 import torch_npu
 import vllm_ascend
 
-from vllm_ascend.utils import enable_custom_op
-
 expected = Path(os.environ["QLI_EXPECTED_VA_WORKDIR"]).resolve()
 installed = Path(vllm_ascend.__file__).resolve()
 try:
@@ -147,7 +160,10 @@ except ValueError as exc:
         f"vllm_ascend is loaded from {installed}, expected editable checkout {expected}"
     ) from exc
 
-enable_custom_op()
+# vLLM-Ascend 0.26 intentionally disables the broad custom-op loader on A5.
+# QLI V2 is supported there, so load its already-built registration library
+# directly, as the A5 MLA prolog path does.
+import vllm_ascend.vllm_ascend_C  # noqa: F401
 required = {
     "npu_quant_lightning_indexer_v2": hasattr(
         torch.ops._C_ascend, "npu_quant_lightning_indexer_v2"
