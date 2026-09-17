@@ -98,12 +98,16 @@ if [[ "$check_only" -eq 1 ]]; then
 fi
 
 if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
+    set +u
     # shellcheck disable=SC1091
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    set -u
 fi
 if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
+    set +u
     # shellcheck disable=SC1091
     source /usr/local/Ascend/nnal/atb/set_env.sh
+    set -u
 fi
 
 echo "Installing patched vLLM-Ascend from $VA_WORKDIR"
