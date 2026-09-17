@@ -166,14 +166,33 @@ if not all(required.values()):
 PY
 }
 
-if installed_check="$(check_installed_runtime 2>&1)"; then
+has_matching_editable_install() {
+QLI_EXPECTED_VA_WORKDIR="$VA_WORKDIR" python3 - <<'PY'
+import json
+import os
+from importlib.metadata import distribution
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+expected = Path(os.environ["QLI_EXPECTED_VA_WORKDIR"]).resolve()
+metadata = distribution("vllm_ascend")
+direct_url_text = metadata.read_text("direct_url.json")
+if not direct_url_text:
+    raise SystemExit(1)
+direct_url = json.loads(direct_url_text)
+installed = Path(unquote(urlparse(direct_url["url"]).path)).resolve()
+editable = direct_url.get("dir_info", {}).get("editable", False)
+raise SystemExit(0 if editable and installed == expected else 1)
+PY
+}
+
+if has_matching_editable_install; then
     echo "Matching patched vLLM-Ascend is already installed; skipping editable build."
-    printf '%s\n' "$installed_check"
 else
     echo "Installing patched vLLM-Ascend from $VA_WORKDIR"
     python3 -m pip install --no-deps --no-build-isolation -e "$VA_WORKDIR"
-    check_installed_runtime
 fi
+check_installed_runtime
 
 cat <<'EOF'
 QLI V2/MXFP4 framework patch and capability smoke check passed.
