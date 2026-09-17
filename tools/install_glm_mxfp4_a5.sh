@@ -111,7 +111,7 @@ if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
 fi
 
 echo "Installing patched vLLM-Ascend from $VA_WORKDIR"
-python3 -m pip install --no-deps -e "$VA_WORKDIR"
+python3 -m pip install --no-deps --no-build-isolation -e "$VA_WORKDIR"
 
 python3 - <<'PY'
 import torch
