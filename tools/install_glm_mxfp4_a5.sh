@@ -13,6 +13,10 @@ VA_BASE_REF="${VA_BASE_REF:-v0.26.0 deployment baseline}"
 VA_BASE_COMMIT="${VA_BASE_COMMIT:-8bfdcf2fe931f7d535e0e67a4e4eba233bccb598}"
 VA_WORKDIR="${VA_WORKDIR:-/workspace/vllm-ascend-qli-mxfp4-v0.26.0}"
 export SOC_VERSION="${SOC_VERSION:-ascend950dt_9582}"
+# Some deployment images retain the legacy `ascend_vllm` platform plugin.
+# Select the vLLM-Ascend plugin installed by this script so vLLM does not try
+# to activate both platform implementations during import.
+export VLLM_PLUGINS="${VLLM_PLUGINS:-ascend}"
 
 update=0
 check_only=0
@@ -140,6 +144,9 @@ PY
 
 cat <<'EOF'
 QLI V2/MXFP4 framework patch and capability smoke check passed.
+
+Keep this environment variable in the GLM-5.2/5.3 service process:
+  export VLLM_PLUGINS=ascend
 
 Add this to the GLM-5.2/5.3 serve command:
   --additional-config '{"enable_sparse_li_c8":true,"sfa_indexer_quant_mode":"mxfp4"}'
