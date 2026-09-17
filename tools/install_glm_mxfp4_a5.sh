@@ -127,15 +127,25 @@ if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
     set -u
 fi
 
-echo "Installing patched vLLM-Ascend from $VA_WORKDIR"
-python3 -m pip install --no-deps --no-build-isolation -e "$VA_WORKDIR"
+check_installed_runtime() {
+QLI_EXPECTED_VA_WORKDIR="$VA_WORKDIR" python3 - <<'PY'
+import os
+from pathlib import Path
 
-python3 - <<'PY'
 import torch
 import torch_npu
 import vllm_ascend
 
 from vllm_ascend.utils import enable_custom_op
+
+expected = Path(os.environ["QLI_EXPECTED_VA_WORKDIR"]).resolve()
+installed = Path(vllm_ascend.__file__).resolve()
+try:
+    installed.relative_to(expected)
+except ValueError as exc:
+    raise RuntimeError(
+        f"vllm_ascend is loaded from {installed}, expected editable checkout {expected}"
+    ) from exc
 
 enable_custom_op()
 required = {
@@ -154,6 +164,16 @@ if not all(required.values()):
     missing = ", ".join(name for name, available in required.items() if not available)
     raise RuntimeError(f"A5 runtime is missing required MXFP4 indexer APIs: {missing}")
 PY
+}
+
+if installed_check="$(check_installed_runtime 2>&1)"; then
+    echo "Matching patched vLLM-Ascend is already installed; skipping editable build."
+    printf '%s\n' "$installed_check"
+else
+    echo "Installing patched vLLM-Ascend from $VA_WORKDIR"
+    python3 -m pip install --no-deps --no-build-isolation -e "$VA_WORKDIR"
+    check_installed_runtime
+fi
 
 cat <<'EOF'
 QLI V2/MXFP4 framework patch and capability smoke check passed.
