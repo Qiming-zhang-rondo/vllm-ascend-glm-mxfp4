@@ -7,7 +7,6 @@ import argparse
 import ast
 import importlib.util
 import os
-import tempfile
 from pathlib import Path
 
 MARKER = "_AV_OPTIONAL_MOONCAKE_PATCH = True"
@@ -148,15 +147,18 @@ def patch_target(target: Path) -> bool:
     backup = target.with_name(target.name + ".before-optional-mooncake")
     if not backup.exists():
         backup.write_bytes(target.read_bytes())
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as output:
-        temp_path = Path(output.name)
-        try:
+    # Avoid tempfile -> random -> bisect: direct invocation puts tools/bisect
+    # ahead of the standard library. Exclusive creation still protects against
+    # collisions; replacing a sibling file remains atomic.
+    temp_path = target.with_name(f".{target.name}.{os.urandom(8).hex()}.tmp")
+    temp_fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as output:
             output.write(updated)
-            output.flush()
-            os.chmod(temp_path, target.stat().st_mode)
-            os.replace(temp_path, target)
-        finally:
-            temp_path.unlink(missing_ok=True)
+        os.chmod(temp_path, target.stat().st_mode)
+        os.replace(temp_path, target)
+    finally:
+        temp_path.unlink(missing_ok=True)
     return True
 
 

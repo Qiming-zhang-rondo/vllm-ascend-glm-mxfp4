@@ -4,6 +4,8 @@
 import builtins
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -33,6 +35,56 @@ from ascend_vllm.patch.platform import patch_spec_anom
 
 
 class OptionalMooncakeTests(unittest.TestCase):
+    def test_direct_script_entrypoint_outside_repository(self):
+        # Test the user's exact launch style. Loading the module in this test
+        # process alone hides tools/bisect shadowing the standard library.
+        script = REPO / "tools/patch_av_optional_mooncake.py"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "__init__.py"
+            target.write_text(LEGACY)
+            for args, expected in (
+                (["--help"], "usage:"),
+                (["--target", str(target)], "Patched:"),
+                (["--target", str(target)], "Already patched:"),
+            ):
+                with self.subTest(args=args):
+                    result = subprocess.run(
+                        [sys.executable, "-S", str(script), *args],
+                        cwd=directory,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(expected, result.stdout)
+            self.assertEqual(
+                self.execute(target.read_text(), {"VLLM_ASCEND_ENABLE_MOONCAKE": "0"}, fail_mooncake=True),
+                ["patch_health", "patch_spec_anom"],
+            )
+
+    def test_direct_script_discovers_av_without_importing_it(self):
+        script = REPO / "tools/patch_av_optional_mooncake.py"
+        with tempfile.TemporaryDirectory() as directory:
+            av_package = Path(directory) / "ascend_vllm"
+            platform = av_package / "patch/platform"
+            platform.mkdir(parents=True)
+            (av_package / "__init__.py").write_text("raise AssertionError('AV must not be imported by the patcher')\n")
+            target = platform / "__init__.py"
+            target.write_text(LEGACY)
+            env = dict(os.environ, PYTHONPATH=directory)
+            result = subprocess.run(
+                [sys.executable, "-S", str(script)],
+                cwd=directory,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(str(target.resolve()), result.stdout)
+            self.assertEqual(
+                self.execute(target.read_text(), {"VLLM_ASCEND_ENABLE_MOONCAKE": "0"}, fail_mooncake=True),
+                ["patch_health", "patch_spec_anom"],
+            )
+
     def execute(self, source, env, fail_mooncake=False):
         imports = []
         real_import = builtins.__import__
