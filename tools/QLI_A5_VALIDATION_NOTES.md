@@ -89,7 +89,27 @@ JSON 中 cosine `1.000000119...` 是浮点误差，应理解为约 1，不代表
 | `17.1875%` / `18.75%` 却显示 Pass | 这是未排序索引逐位置接近的比例，不是 TopK 集合 recall；官方比较先排序检查集合，两份 PA 日志均显示集合相同 | `result_compare_method.py::check_result`；没有修改官方阈值 |
 | profiler 提示停止时仍处于 RECORD | 不凭 warning 猜测成败；本次导出完成，汇总器要求恰好 20 条有效 QLI compute 记录，两例满足 | `qli_official_perf_summary.py::summarize_case`；不能推广为所有采集都完整 |
 | 大 shape 末尾 `Accuracy gate failed` | 计算和计时已完成；C4 相对原始输入的 recall 未达 90% | 最新用户 JSON；仍为失败，不改成通过 |
-| `libcust_opmaster_rt2.0.so` 缺 `Ops::Base::ToString(gert::Shape const&)` | 两次官方通过日志仍有这个 host tiling 库加载错误，属于尚未处理的独立问题 | 不能宣称整个私有 OPP 加载正常、ABI 冲突已定论或已确认 fallback |
+| host tiling 库缺 `Ops::Base::ToString(gert::Shape const&)` | 早期两次官方通过日志仍有这个加载错误；9 月 18 日新容器离线构建中，它导致 `liboptiling.so` 加载失败，随后 tiling struct 未注册、`QLIV2TilingData` 未定义、`.o` 未生成。现将 53 处 shape 日志格式化改为局部实现，待 A5 重新构建验证 | 仅改变日志字符串的生成方式，保持格式及所有检查条件、tiling 和 kernel 不变；不能据此宣称历史运行的 OPP 来源或 ABI 冲突已确定 |
+
+### 2026-09-18：QLI 构建期间的 tiling 库加载失败
+
+A5 默认启用 `BUILD_WITH_3_8_PACKAGE`（`csrc/CMakeLists.txt`）；
+`csrc/cmake/custom_build.cmake` 的该分支未链接 `opsbase`。
+QLI 的 `op_host/quant_lightning_indexer_v2_tiling.cpp` 却有 53 处日志调用依赖
+`Ops::Base::ToString(gert::Shape const&)`。本次日志明确报告该符号无法解析。
+修复用同文件已有的 `ToStringRaw` 加局部 `FormatShape` 保持 `[dim0, dim1]`
+格式，移除这项外部依赖；没有给 device kernel 强行包含 host 头文件。
+
+生成关系可对照 `ops-transformer@55498d916` 的
+`tests/ut/framework_normal/op_kernel/scripts/gen_tiling_head_file.py`：
+先加载 tiling 库并注册，随后获取 tiling 信息并写入 kernel 所需头文件。
+因此应处理更早的库加载失败，而不是手工补齐最终缺失的 `.o`。
+
+本地 CPU 回归编译、链接并加载真实 formatter helper，覆盖空 shape、动态维、
+普通维和 64 位维度，同时阻止外部 shape formatter 调用重新引入。
+这不代表完整 CANN 编译或 A5 执行已通过。
+容器中需重新运行 `tools/test_qli_v2_mxfp4_a5.sh --build-op --check-only --jobs 8`，
+构建成功后 source `tools/activate_qli_mxfp4_a5.sh`；本修复不需要重新安装 VA。
 
 ## 关于 tiling、kernel 和加载来源，纠正此前的推断
 
