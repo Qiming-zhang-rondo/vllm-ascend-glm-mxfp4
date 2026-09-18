@@ -39,15 +39,49 @@ Run this inside the existing A5 vLLM-Ascend container:
 ```bash
 git clone https://github.com/Qiming-zhang-rondo/vllm-ascend-glm-mxfp4.git
 cd vllm-ascend-glm-mxfp4
-bash tools/install_glm_mxfp4_a5.sh --update
+bash tools/install_glm_mxfp4_a5.sh
 ```
 
 The installer leaves the vLLM-Ascend copy baked into the container untouched.
 It checks out the exact upstream commit in
 `/workspace/vllm-ascend-qli-mxfp4-v0.26.0`, verifies the complete patch with
 `git apply --check`, applies it, rebuilds `_C_ascend` through an editable
-install, and checks that the required PyTorch NPU APIs are registered. It
-refuses to apply the patch to another framework commit.
+install when necessary, and checks the PyTorch wrappers and underlying ACLNN
+symbols separately. A matching editable install is reused. It refuses to apply
+the patch to another framework commit. `--update` deliberately recreates the
+isolated checkout; it is not needed just to load an already-built QLI library.
+
+Before starting the service, activate the existing QLI installation **in the
+same shell**, after sourcing the container's CANN environment:
+
+```bash
+source /workspace/vllm-ascend-glm-mxfp4/tools/activate_qli_mxfp4_a5.sh
+```
+
+This first uses the delivery checkout's `.qli-op-build/install.json`, then the
+standalone checkout's manifest at
+`/workspace/vllm-ascend-glm-mxfp4-optest/.qli-op-build/install.json` (or that
+checkout alongside the delivery repository). An installation elsewhere can be
+selected with `--manifest /path/to/install.json` or
+`--opapi-lib /path/to/vendor/op_api/lib/libcust_opapi.so`. Without a manifest,
+it checks the configured CANN vendor libraries and `libopapi.so`.
+
+The script prepends the selected vendor root to `ASCEND_CUSTOM_OPP_PATH`, its
+API library directory to `LD_LIBRARY_PATH`, and disables FLA startup injection.
+It checks both compute/metadata ACLNN APIs and their `GetWorkspaceSize` exports
+in a fresh process and prints their library ownership. It performs no build,
+installation, dependency download, or device computation. A failed activation
+does not change the caller's environment. Explicit private installations must
+contain all four APIs; incomplete installations do not silently use another
+vendor's metadata.
+
+The standalone test and the installer run in child shells, so their environment
+exports do not persist into a separately launched service. The VA C++ adapter
+snapshots vendor paths when loaded and caches symbol pointers at first use;
+after activation, start **new workers**. A `torch.ops` registration alone cannot
+detect missing CANN symbols. A symbol preflight does not prove MXFP4 compute,
+model accuracy, or tiling/device-kernel ownership, and later code that changes
+vendor priority can affect the service's actual library selection.
 
 Start GLM-5.2 or GLM-5.3 with these additional settings:
 

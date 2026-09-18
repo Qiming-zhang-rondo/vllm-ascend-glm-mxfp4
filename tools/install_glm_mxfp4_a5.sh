@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Set these before the first Python process, including plugin discovery.
+export FLA_NPU_DISABLE_PTH=1
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
 # Install the GLM SFA QLI V2 MXFP4 framework integration without modifying the
 # vLLM-Ascend source tree baked into the container. The script checks out the
 # exact deployment baseline in a separate directory, verifies the patch in full,
@@ -142,6 +146,11 @@ if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
     set -u
 fi
 
+# Wrapper registration alone does not prove that the CANN APIs can be loaded.
+# Reuse an existing private install when available; never rebuild operators here.
+# shellcheck source=tools/activate_qli_mxfp4_a5.sh
+source "$SCRIPT_DIR/activate_qli_mxfp4_a5.sh"
+
 check_installed_runtime() {
 QLI_EXPECTED_VA_WORKDIR="$VA_WORKDIR" python3 - <<'PY'
 import os
@@ -211,7 +220,13 @@ fi
 check_installed_runtime
 
 cat <<'EOF'
-QLI V2/MXFP4 framework patch and capability smoke check passed.
+QLI framework wrapper and ACLNN symbol checks passed; A5 compute is not verified by this check.
+
+The installer cannot change its parent shell. Before starting a NEW service
+process, source the runtime environment in that same shell (after CANN setup):
+EOF
+printf '  source %q\n' "$SCRIPT_DIR/activate_qli_mxfp4_a5.sh"
+cat <<'EOF'
 
 Keep the platform selected above in the GLM-5.2/5.3 service process. On an AV
 deployment image this is normally:
