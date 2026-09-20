@@ -94,6 +94,47 @@ Start GLM-5.2 or GLM-5.3 with these additional settings:
 contract. The configuration rejects MXFP4 on non-A5 devices and when LI C8 is
 disabled.
 
+If profiling still shows the old LightningIndexer after restarting, install
+temporary worker diagnostics in the **already patched deployment checkout**:
+
+```bash
+python3 -I /workspace/vllm-ascend-glm-mxfp4/tools/trace_qli_dispatch.py
+```
+
+Then restart using the same service command, including the QLI environment
+activation above. The tool changes only Python diagnostic hooks and does not
+rebuild/install VA or CANN, change quantization, or replace AV's methods. It
+preserves local changes such as adding `FP8_DYNAMIC` to the layer filter.
+Use `--va-root PATH` for another deployment checkout; `--check-only` validates
+the expected methods without modifying files.
+
+Look for `[QLI-DISPATCH]` in the worker output. The metadata-builder snapshot
+inspects the actual Attention implementations in `static_forward_context`,
+including `layer.impl` and `layer.mla_attn.impl`. It reports the effective
+per-layer switches, indexer mode/cache prefix, layer-filter settings and the
+file/line of the bound compute methods and their `DeviceOperator`. Methods
+outside the community VA package also include a bounded source excerpt, when
+available, to help identify AV overrides. Instances with identical settings
+and methods are grouped; representative names and total counts are reported.
+
+`device_entry` and `compute_entry` records identify entry into the instrumented
+Python methods; they do not prove successful ACLNN/device execution. These
+entry hooks are skipped inside `torch.compile` to avoid introducing diagnostic
+code into the graph. Their absence alone does not prove a bypass. A snapshot
+of a bound method likewise does not prove it was called. Tensor diagnostics
+contain metadata only and do not read NPU tensor values.
+
+Remove the temporary hooks once the route is understood, and restart before
+collecting performance measurements:
+
+```bash
+python3 -I /workspace/vllm-ascend-glm-mxfp4/tools/trace_qli_dispatch.py --remove
+```
+
+Removal strips only the marked diagnostic blocks, preserving other edits;
+the dormant helper remains on disk. Original modified files are also backed
+up with the suffix `.before-qli-dispatch-trace`.
+
 To verify patch applicability without compiling or installing anything:
 
 ```bash
