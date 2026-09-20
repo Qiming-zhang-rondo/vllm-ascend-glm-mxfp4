@@ -94,6 +94,33 @@ Start GLM-5.2 or GLM-5.3 with these additional settings:
 contract. The configuration rejects MXFP4 on non-A5 devices and when LI C8 is
 disabled.
 
+For an existing deployment whose worker log shows `filter_enabled=true`,
+empty `layer_ids`, and model entries tagged `FP8_DYNAMIC`, update the layer
+selector in the actual deployment checkout:
+
+```bash
+git -C /workspace/vllm-ascend-glm-mxfp4 pull --ff-only && \
+python3 -I /workspace/vllm-ascend-glm-mxfp4/tools/fix_qli_fp8_dynamic.py
+```
+
+This edits only `AscendConfig._parse_sparse_li_c8_layers_from_quant_config`
+in `/workspace/vllm-ascend-qli-mxfp4-v0.26.0/vllm_ascend/ascend_config.py`,
+adding `FP8_DYNAMIC` beside `INT8_DYNAMIC` and `W8A8_MXFP8`. Use `--va-root`
+for a different deployment checkout. It backs up the original file, preserves
+other edits and diagnostic hooks, and performs no compilation or installation.
+New installs already include the correction in the deployment patch.
+
+Restart all service workers after applying it: layer selection and cache
+allocation are established at initialization. The reported A5 worker logs
+showed that the patched VA methods were active, but all 22 Indexer instances
+had quantization disabled because none of the 16 `FP8_DYNAMIC` entries passed
+the old allowlist. Metadata used the global mode while compute used the
+per-layer flag, explaining why V2 metadata coexisted with BF16 LightningIndexer
+compute. The fix retains configured layer exclusions; it does not force every
+Indexer layer to MXFP4. Verify that matching layers are selected and enter
+mode 5 after restart. Local selector tests do not establish A5 compute or
+end-to-end accuracy.
+
 If profiling still shows the old LightningIndexer after restarting, install
 temporary worker diagnostics in the **already patched deployment checkout**:
 

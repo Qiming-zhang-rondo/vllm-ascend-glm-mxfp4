@@ -944,7 +944,7 @@ index 000000000..1c38c38f6
 +            torch.zeros(1, dtype=torch.int32),
 +        )
 diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
-index 90b5beec5..c327684cb 100644
+index 90b5beec5..4355cfcda 100644
 --- a/vllm_ascend/ascend_config.py
 +++ b/vllm_ascend/ascend_config.py
 @@ -285,6 +285,12 @@ class AscendConfig:
@@ -990,6 +990,15 @@ index 90b5beec5..c327684cb 100644
  
      def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
          if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
+@@ -454,7 +483,7 @@ class AscendConfig:
+             return set(), set()
+ 
+         QUANT_SUFFIXES = (".indexer.quant_type", ".indexer.wq_b_weight")
+-        VALID_QUANT_TYPES = ("INT8_DYNAMIC", "W8A8_MXFP8")
++        VALID_QUANT_TYPES = ("INT8_DYNAMIC", "W8A8_MXFP8", "FP8_DYNAMIC")
+ 
+         layer_ids: set[int] = set()
+         layer_names: set[str] = set()
 diff --git a/vllm_ascend/attention/sfa_indexer.py b/vllm_ascend/attention/sfa_indexer.py
 new file mode 100644
 index 000000000..71f0ee0fc

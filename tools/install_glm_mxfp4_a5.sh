@@ -129,9 +129,14 @@ else
 fi
 
 if [[ "$check_only" -eq 1 ]]; then
+    python3 -I "$SCRIPT_DIR/fix_qli_fp8_dynamic.py" --va-root "$VA_WORKDIR" --check-only
     echo "Patched checkout verified; installation skipped."
     exit 0
 fi
+
+# Existing deployments predate FP8_DYNAMIC layer-tag support. This Python-only
+# correction preserves local configuration edits and does not require a build.
+python3 -I "$SCRIPT_DIR/fix_qli_fp8_dynamic.py" --va-root "$VA_WORKDIR"
 
 if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     set +u
