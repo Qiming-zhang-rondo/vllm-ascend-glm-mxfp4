@@ -7,6 +7,7 @@ import functools
 import importlib.util
 import io
 import json
+import re
 import sys
 import tempfile
 import types
@@ -64,15 +65,52 @@ class CountingContext(dict):
 class FakeAscendConfig:
     enable_sparse_li_c8 = True
     sfa_indexer_quant_mode = "mxfp4"
-    _sparse_li_c8_layer_filter_enabled = True
-    _sparse_li_c8_layer_names = {"model.layers.0.self_attn.indexer"}
-    _sparse_li_c8_layer_ids = {0}
+
+    def __init__(self):
+        self._sparse_li_c8_layer_filter_enabled = True
+        self._sparse_li_c8_layer_names = {"model.layers.0.self_attn"}
+        self._sparse_li_c8_layer_ids = {0}
+
+    @staticmethod
+    def layer_index(prefix):
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", prefix)
+        if match is None:
+            raise ValueError("Test prefix has no layer index")
+        return int(match[1])
 
     def is_sparse_li_c8_layer(self, prefix):
-        return prefix in self._sparse_li_c8_layer_names
+        if not self.enable_sparse_li_c8:
+            return False
+        if not self._sparse_li_c8_layer_filter_enabled:
+            return True
+        if not prefix:
+            return False
+        name_match = any(prefix == name or prefix.startswith(name + ".") for name in self._sparse_li_c8_layer_names)
+        return name_match or self.layer_index(prefix) in self._sparse_li_c8_layer_ids
 
-    def _parse_sparse_li_c8_layers_from_quant_config(self):
-        return self._sparse_li_c8_layer_ids, self._sparse_li_c8_layer_names
+    def _has_sparse_li_c8_layer_config(self, quant_config):
+        description = getattr(quant_config, "quant_description", None)
+        return isinstance(description, dict) and any(
+            isinstance(key, str) and key.endswith((".indexer.quant_type", ".indexer.wq_b_weight"))
+            for key in description
+        )
+
+    def _parse_sparse_li_c8_layers_from_quant_config(self, quant_config):
+        valid_types = ("INT8_DYNAMIC", "W8A8_MXFP8", "FP8_DYNAMIC")
+        return self._parse_description(quant_config, valid_types)
+
+    def _parse_description(self, quant_config, valid_types):
+        description = getattr(quant_config, "quant_description", None)
+        if not isinstance(description, dict):
+            return set(), set()
+        names = set()
+        for key, value in description.items():
+            if not isinstance(key, str) or value not in valid_types:
+                continue
+            suffix = next((s for s in (".indexer.quant_type", ".indexer.wq_b_weight") if key.endswith(s)), None)
+            if suffix:
+                names.add(key[: -len(suffix)])
+        return {self.layer_index(name) for name in names}, names
 
 
 class TestQliDispatchDebug(unittest.TestCase):
@@ -101,6 +139,8 @@ class TestQliDispatchDebug(unittest.TestCase):
         self.config.vllm_config = self.vllm_config
         vllm_config_module = types.ModuleType("vllm.config")
         vllm_config_module.get_current_vllm_config = lambda: self.vllm_config
+        model_utils = types.ModuleType("vllm.model_executor.models.utils")
+        model_utils.extract_layer_index = FakeAscendConfig.layer_index
         packages = {}
         for name in ("vllm", "vllm_ascend", "vllm_ascend.device", "vllm_ascend.attention"):
             module = types.ModuleType(name)
@@ -109,7 +149,12 @@ class TestQliDispatchDebug(unittest.TestCase):
         self.enterContext(
             patch.dict(
                 sys.modules,
-                {**packages, "vllm_ascend.ascend_config": config_module, "vllm.config": vllm_config_module},
+                {
+                    **packages,
+                    "vllm_ascend.ascend_config": config_module,
+                    "vllm.config": vllm_config_module,
+                    model_utils.__name__: model_utils,
+                },
             )
         )
         spec = importlib.util.spec_from_file_location("qli_dispatch_debug_fixture", HELPER)
@@ -144,6 +189,157 @@ class TestQliDispatchDebug(unittest.TestCase):
         impl.prefix = f"model.layers.{index}.self_attn"
         impl.indexer = types.SimpleNamespace(k_cache=types.SimpleNamespace(prefix=f"{impl.prefix}.indexer"))
         return impl
+
+    def worker_snapshot(self):
+        events = self.capture(self.helper.report_worker_dispatch, self.builder)
+        snapshots = [event for event in events if event["event"] == "worker_snapshot"]
+        self.assertEqual(len(snapshots), 1, events)
+        return snapshots[0]
+
+    def set_cached_selection(self, ids, names, *, filter_enabled=True):
+        self.config._sparse_li_c8_layer_ids = set(ids)
+        self.config._sparse_li_c8_layer_names = set(names)
+        self.config._sparse_li_c8_layer_filter_enabled = filter_enabled
+
+    def test_fresh_fp8_selection_exposes_empty_initial_cache_without_changing_runtime_state(self):
+        self.set_cached_selection([], [])
+        initialization_config = types.SimpleNamespace(quant_description={})
+        self.capture(self.helper.report_selector_initialization, self.config, initialization_config)
+        initialization = json.loads(json.dumps(self.config._qli_selector_initialization))
+        self.vllm_config.quant_config.quant_description = {
+            "model.layers.10.self_attn.indexer.quant_type": "FP8_DYNAMIC"
+        }
+        impl = self.implementation(10, quantized=False)
+        self.context["layer10"] = types.SimpleNamespace(impl=impl)
+        cached_ids = self.config._sparse_li_c8_layer_ids
+        cached_names = self.config._sparse_li_c8_layer_names
+
+        snapshot = self.worker_snapshot()
+        diagnosis = snapshot["selection_diagnosis"]
+        self.assertEqual(diagnosis["cached"]["layer_ids"], [])
+        self.assertEqual(diagnosis["cached"]["layer_names"], [])
+        self.assertTrue(diagnosis["cached"]["filter_enabled"])
+        self.assertEqual(diagnosis["fresh"]["layer_ids"], [10])
+        self.assertEqual(diagnosis["fresh"]["layer_names"], ["model.layers.10.self_attn"])
+        self.assertFalse(diagnosis["fresh_matches_cached"])
+        self.assertEqual(diagnosis["initialization"], initialization)
+        self.assertIn("FP8_DYNAMIC", diagnosis["parser"]["quant_label_constants"])
+        self.assertRegex(diagnosis["parser"]["code_sha256"], r"^[0-9a-f]{64}$")
+        match = diagnosis["layer_matches"][0]
+        self.assertFalse(match["impl_enabled"])
+        self.assertFalse(match["current_layer_enabled"])
+        self.assertFalse(match["cached_name_match"])
+        self.assertFalse(match["cached_id_match"])
+        self.assertTrue(match["fresh_name_match"])
+        self.assertTrue(match["fresh_id_match"])
+        self.assertIs(self.config._sparse_li_c8_layer_ids, cached_ids)
+        self.assertIs(self.config._sparse_li_c8_layer_names, cached_names)
+        self.assertEqual(cached_ids, set())
+        self.assertEqual(cached_names, set())
+        self.assertFalse(impl.enable_sparse_li_c8)
+
+    def test_initialization_snapshot_survives_later_quant_config_mutation(self):
+        description = {"model.layers.10.self_attn.indexer.quant_type": "FP8_DYNAMIC"}
+        self.vllm_config.quant_config.quant_description = description
+        self.set_cached_selection([10], ["model.layers.10.self_attn"])
+        self.capture(self.helper.report_selector_initialization, self.config, self.vllm_config.quant_config)
+        frozen = json.loads(json.dumps(self.config._qli_selector_initialization))
+        self.assertIn("model.layers.10.self_attn.indexer.quant_type", json.dumps(frozen))
+        description["model.layers.10.self_attn.indexer.quant_type"] = "BF16"
+        description["model.layers.20.self_attn.indexer.quant_type"] = "FP8_DYNAMIC"
+        self.assertEqual(self.config._qli_selector_initialization, frozen)
+        self.context["layer20"] = types.SimpleNamespace(impl=self.implementation(20, quantized=False))
+
+        diagnosis = self.worker_snapshot()["selection_diagnosis"]
+        self.assertEqual(diagnosis["initialization"], frozen)
+        self.assertEqual(diagnosis["cached"]["layer_ids"], [10])
+        self.assertEqual(diagnosis["fresh"]["layer_ids"], [20])
+        self.assertFalse(diagnosis["fresh_matches_cached"])
+        self.assertNotIn("model.layers.20.self_attn.indexer.quant_type", json.dumps(diagnosis["initialization"]))
+        self.assertEqual(description["model.layers.10.self_attn.indexer.quant_type"], "BF16")
+
+    def test_layer_id_fallback_distinguishes_name_mismatch_unmatched_and_empty_prefix(self):
+        self.set_cached_selection([10], ["cached.layers.10.other_attn"])
+        self.vllm_config.quant_config.quant_description = {
+            "export.layers.10.source_attn.indexer.quant_type": "FP8_DYNAMIC"
+        }
+        matched = self.implementation(10, quantized=False)
+        unmatched = self.implementation(12, quantized=False)
+        empty = self.implementation(10, quantized=False)
+        empty.indexer.k_cache.prefix = ""
+        no_prefix = self.implementation(10, quantized=False)
+        no_prefix.indexer.k_cache.prefix = None
+        no_indexer = self.implementation(10, quantized=False)
+        no_indexer.has_indexer = False
+        for name, impl in (
+            ("matched", matched),
+            ("unmatched", unmatched),
+            ("empty", empty),
+            ("none", no_prefix),
+            ("no_indexer", no_indexer),
+        ):
+            self.context[name] = types.SimpleNamespace(impl=impl)
+
+        diagnosis = self.worker_snapshot()["selection_diagnosis"]
+        self.assertIsNone(diagnosis["initialization"])
+        matches = {row["layer"]: row for row in diagnosis["layer_matches"]}
+        self.assertEqual(set(matches), {"matched", "unmatched", "empty", "none"})
+        self.assertEqual(matches["matched"]["layer_id"], 10)
+        self.assertTrue(matches["matched"]["current_layer_enabled"])
+        for key in ("cached_name_match", "fresh_name_match"):
+            self.assertFalse(matches["matched"][key])
+        for key in ("cached_id_match", "fresh_id_match"):
+            self.assertTrue(matches["matched"][key])
+        for name in ("unmatched", "empty", "none"):
+            for key in ("cached_name_match", "cached_id_match", "fresh_name_match", "fresh_id_match"):
+                self.assertFalse(matches[name][key], (name, key))
+        self.assertFalse(matches["unmatched"]["current_layer_enabled"])
+        for name in ("empty", "none"):
+            self.assertIsNone(matches[name]["layer_id"])
+            self.assertIsNone(matches[name]["current_layer_enabled"])
+            self.assertEqual(matches[name]["error"]["type"], "MissingCachePrefix")
+
+    def test_legacy_bound_parser_is_identified_and_still_has_empty_fresh_selection(self):
+        namespace = {}
+        source = (
+            "def legacy_parser(self, quant_config):\n"
+            "    valid_types = ('INT8_DYNAMIC', 'W8A8_MXFP8')\n"
+            "    return self._parse_description(quant_config, valid_types)\n"
+        )
+        exec(compile(source, "/av/legacy_selector.py", "exec"), namespace)
+        self.config._parse_sparse_li_c8_layers_from_quant_config = types.MethodType(
+            namespace["legacy_parser"], self.config
+        )
+        self.vllm_config.quant_config.quant_description = {
+            "model.layers.10.self_attn.indexer.quant_type": "FP8_DYNAMIC"
+        }
+        self.set_cached_selection([], [])
+        self.context["layer10"] = types.SimpleNamespace(impl=self.implementation(10, quantized=False))
+
+        diagnosis = self.worker_snapshot()["selection_diagnosis"]
+        self.assertEqual(diagnosis["fresh"]["layer_ids"], [])
+        self.assertTrue(diagnosis["fresh_matches_cached"])
+        parser = diagnosis["parser"]
+        self.assertEqual(parser["source"]["file"], "/av/legacy_selector.py")
+        self.assertNotIn("FP8_DYNAMIC", parser["quant_label_constants"])
+        self.assertIn("INT8_DYNAMIC", parser["quant_label_constants"])
+        self.assertIn("W8A8_MXFP8", parser["quant_label_constants"])
+        self.assertRegex(parser["code_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_parser_exception_is_reported_without_losing_worker_snapshot(self):
+        def broken_parser(config, quant_config):
+            raise ValueError("fixture parser failure")
+
+        self.config._parse_sparse_li_c8_layers_from_quant_config = types.MethodType(broken_parser, self.config)
+        impl = self.implementation(0, quantized=True)
+        self.context["layer0"] = types.SimpleNamespace(impl=impl)
+        snapshot = self.worker_snapshot()
+        self.assertTrue(snapshot["snapshot_only"])
+        self.assertEqual(snapshot["groups"][0]["count"], 1)
+        diagnosis = snapshot["selection_diagnosis"]
+        self.assertIn("fixture parser failure", json.dumps(diagnosis["error"]))
+        self.assertEqual(self.config._sparse_li_c8_layer_ids, {0})
+        self.assertTrue(impl.enable_sparse_li_c8)
 
     def install_av_subclass(self, *, wrapped=False):
         path = self.directory / "av" / "patch_sfa.py"

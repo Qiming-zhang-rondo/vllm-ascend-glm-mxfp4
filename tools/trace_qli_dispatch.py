@@ -18,6 +18,7 @@ BEGIN = "# QLI_DISPATCH_DEBUG_BEGIN:"
 END = "# QLI_DISPATCH_DEBUG_END:"
 HELPER_MARKER = "QLI_DISPATCH_DEBUG_HELPER_V1"
 EXPECTED_PARAMETERS = {
+    "selector_init": {"self", "vllm_config"},
     "worker": {"self", "cumulative_query_lens", "seq_lens", "draft_index"},
     "compute": {"query", "key", "weights", "query_scale", "key_scale", "block_table", "metadata"},
     "device": {
@@ -35,6 +36,14 @@ EXPECTED_PARAMETERS = {
     },
 }
 HOOKS = (
+    (
+        "ascend_config.py",
+        "AscendConfig",
+        "__init__",
+        "selector_init",
+        "report_selector_initialization",
+        ("self", "quant_config"),
+    ),
     (
         "attention/sfa_indexer.py",
         "SFAIndexerMetadataBuilder",
@@ -84,6 +93,67 @@ def remove_hooks(source: str) -> str:
     return "".join(lines)
 
 
+def selector_initialization_anchor(function: ast.FunctionDef) -> ast.Assign:
+    """Locate the completed selector setup without changing its execution order."""
+    ids_name = "_sparse_li_c8_layer_ids"
+    names_name = "_sparse_li_c8_layer_names"
+    filter_name = "_sparse_li_c8_layer_filter_enabled"
+
+    def self_attribute(node: ast.AST, name: str) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and node.attr == name
+        )
+
+    def assignments_to(names: tuple[str, ...]) -> list[ast.Assign]:
+        return [
+            statement
+            for statement in function.body
+            if isinstance(statement, ast.Assign)
+            and any(
+                self_attribute(node, name)
+                for target in statement.targets
+                for node in ast.walk(target)
+                for name in names
+            )
+        ]
+
+    def selector_call(node: ast.AST, method: str) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and self_attribute(node.func, method)
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "quant_config"
+            and not node.keywords
+        )
+
+    parsers = assignments_to((ids_name, names_name))
+    filters = assignments_to((filter_name,))
+    if len(parsers) != 1 or len(filters) != 1:
+        raise ValueError("Expected unique top-level selector parse/filter assignments in AscendConfig.__init__")
+    parser, anchor = parsers[0], filters[0]
+    if (
+        len(parser.targets) != 1
+        or not isinstance(parser.targets[0], ast.Tuple)
+        or len(parser.targets[0].elts) != 2
+        or not self_attribute(parser.targets[0].elts[0], ids_name)
+        or not self_attribute(parser.targets[0].elts[1], names_name)
+        or not selector_call(parser.value, "_parse_sparse_li_c8_layers_from_quant_config")
+        or len(anchor.targets) != 1
+        or not self_attribute(anchor.targets[0], filter_name)
+        or not selector_call(anchor.value, "_has_sparse_li_c8_layer_config")
+        or parser.end_lineno >= anchor.lineno
+    ):
+        raise ValueError("Unexpected selector parse/filter contract or order in AscendConfig.__init__")
+    position = function.body.index(anchor)
+    if position + 1 < len(function.body) and function.body[position + 1].lineno <= anchor.end_lineno:
+        raise ValueError("Inline statements after selector initialization are unsupported")
+    return anchor
+
+
 def add_hooks(source: str, relative: str) -> str:
     source = remove_hooks(source)
     tree = ast.parse(source)
@@ -107,6 +177,22 @@ def add_hooks(source: str, relative: str) -> str:
             raise ValueError(
                 f"Unexpected arguments of {function_name}: missing {EXPECTED_PARAMETERS[event] - parameters}"
             )
+        if event == "selector_init":
+            anchor = selector_initialization_anchor(function)
+            indentation = " " * anchor.col_offset
+            # This configuration module need not import torch. Diagnostics are
+            # best-effort and must not turn a valid configuration into a failure.
+            block = (
+                f"{indentation}{BEGIN}{event}\n"
+                f"{indentation}try:\n"
+                f"{indentation}    from vllm_ascend.attention.qli_dispatch_debug import {reporter}\n"
+                f"{indentation}    {reporter}({', '.join(arguments)})\n"
+                f"{indentation}except Exception:\n"
+                f"{indentation}    pass\n"
+                f"{indentation}{END}{event}\n"
+            )
+            insertions.append((anchor.end_lineno, block))
+            continue
         statement = function.body[0]
         if statement.lineno == function.lineno:
             raise ValueError(f"Single-line function {function_name} is unsupported; file left unchanged")

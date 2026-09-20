@@ -3,6 +3,7 @@
 """Exercise the dispatch-trace installer without torch, CANN, or an NPU."""
 
 import ast
+import builtins
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,34 @@ class A5DeviceAdaptor:
                 use_torch_npu_lightning_indexer)
 '''
 
+CONFIG_SOURCE = '''"""Existing configuration module documentation."""
+DEFAULT_INDEXER_QUANT_MODE = "FP8_DYNAMIC"
+
+
+class AscendConfig:
+    """Preserve configuration documentation."""
+
+    def __init__(self, vllm_config):
+        """Preserve initializer documentation."""
+        self.enable_sparse_li_c8 = vllm_config.enabled
+        quant_config = vllm_config.quant_config
+        (
+            self._sparse_li_c8_layer_ids,
+            self._sparse_li_c8_layer_names,
+        ) = self._parse_sparse_li_c8_layers_from_quant_config(quant_config)
+        self._sparse_li_c8_layer_filter_enabled = self._has_sparse_li_c8_layer_config(quant_config)
+        self.initialization_finished = True
+
+    @staticmethod
+    def _parse_sparse_li_c8_layers_from_quant_config(quant_config):
+        VALID_QUANT_TYPES = ("INT8_DYNAMIC", "W8A8_MXFP8", "FP8_DYNAMIC")
+        return set(quant_config["ids"]), set(quant_config["names"])
+
+    @staticmethod
+    def _has_sparse_li_c8_layer_config(quant_config):
+        return quant_config["filtered"]
+'''
+
 
 def docstrings(source):
     return {
@@ -70,7 +99,7 @@ class TestQliDispatchTraceInstaller(unittest.TestCase):
         self.originals = {
             SFA_PATH: SFA_SOURCE,
             DEVICE_PATH: DEVICE_SOURCE,
-            CONFIG_PATH: 'DEFAULT_INDEXER_QUANT_MODE = "FP8_DYNAMIC"\n',
+            CONFIG_PATH: CONFIG_SOURCE,
         }
         for relative, content in self.originals.items():
             path = self.va_root / relative
@@ -102,16 +131,33 @@ class TestQliDispatchTraceInstaller(unittest.TestCase):
     def test_install_is_idempotent_and_preserves_backups_and_config(self):
         self.assert_succeeds(self.run_installer())
         installed = self.snapshot()
-        for relative in (SFA_PATH, DEVICE_PATH):
+        for relative in (SFA_PATH, DEVICE_PATH, CONFIG_PATH):
             source = (self.va_root / relative).read_text()
             self.assertIn("QLI_DISPATCH_DEBUG_BEGIN:", source)
             self.assertEqual(docstrings(source), docstrings(self.originals[relative]))
             backup = self.va_root / (str(relative) + ".before-qli-dispatch-trace")
             self.assertEqual(backup.read_text(), self.originals[relative])
         self.assertTrue((self.va_root / HELPER_PATH).is_file())
-        self.assertEqual((self.va_root / CONFIG_PATH).read_text(), self.originals[CONFIG_PATH])
+        config = (self.va_root / CONFIG_PATH).read_text()
+        self.assertIn('DEFAULT_INDEXER_QUANT_MODE = "FP8_DYNAMIC"', config)
+        self.assertIn('VALID_QUANT_TYPES = ("INT8_DYNAMIC", "W8A8_MXFP8", "FP8_DYNAMIC")', config)
         self.assert_succeeds(self.run_installer())
         self.assertEqual(self.snapshot(), installed)
+
+    def test_install_upgrades_existing_three_hooks_without_replacing_backups(self):
+        self.assert_succeeds(self.run_installer())
+        (self.va_root / CONFIG_PATH).write_text(CONFIG_SOURCE)
+        config_backup = self.va_root / (str(CONFIG_PATH) + ".before-qli-dispatch-trace")
+        config_backup.unlink()
+        (self.va_root / HELPER_PATH).write_text("# QLI_DISPATCH_DEBUG_HELPER_V1\n# Previous three-hook helper.\n")
+        original_hooks = {relative: (self.va_root / relative).read_bytes() for relative in (SFA_PATH, DEVICE_PATH)}
+        self.assert_succeeds(self.run_installer())
+        for relative, content in original_hooks.items():
+            self.assertEqual((self.va_root / relative).read_bytes(), content)
+            backup = self.va_root / (str(relative) + ".before-qli-dispatch-trace")
+            self.assertEqual(backup.read_text(), self.originals[relative])
+        self.assertEqual(config_backup.read_text(), CONFIG_SOURCE)
+        self.assertEqual((self.va_root / CONFIG_PATH).read_text().count("QLI_DISPATCH_DEBUG_BEGIN:selector_init"), 1)
 
     def test_remove_preserves_unrelated_edits_and_keeps_helper(self):
         self.assert_succeeds(self.run_installer())
@@ -187,6 +233,47 @@ class TestQliDispatchTraceInstaller(unittest.TestCase):
                 else:
                     self.assertEqual(len(calls), 3)
 
+    def test_selector_initialization_runs_after_assignments_without_torch_and_swallows_diagnostic_errors(self):
+        self.assert_succeeds(self.run_installer())
+        source = (self.va_root / CONFIG_PATH).read_text()
+        self.assertNotIn("torch", source)
+        namespace = {}
+        exec(compile(source, str(CONFIG_PATH), "exec"), namespace)
+        quant_config = {"ids": [2, 4], "names": ["layer.2", "layer.4"], "filtered": True}
+        vllm_config = types.SimpleNamespace(enabled=True, quant_config=quant_config)
+        calls = []
+
+        def report(selector, quant):
+            self.assertIs(quant, quant_config)
+            self.assertEqual(selector._sparse_li_c8_layer_ids, {2, 4})
+            self.assertEqual(selector._sparse_li_c8_layer_names, {"layer.2", "layer.4"})
+            self.assertTrue(selector._sparse_li_c8_layer_filter_enabled)
+            self.assertFalse(hasattr(selector, "initialization_finished"))
+            calls.append(selector)
+            raise RuntimeError("Diagnostic reporting must not abort configuration")
+
+        original_import = builtins.__import__
+        helper = types.SimpleNamespace(report_selector_initialization=report)
+        import_failure = [False]
+
+        def intercept_import(name, *args, **kwargs):
+            if name == "torch" or name.startswith("torch."):
+                raise AssertionError("Selector initialization must not import torch")
+            if name == "vllm_ascend.attention.qli_dispatch_debug":
+                if import_failure[0]:
+                    raise ImportError("Diagnostic helper unavailable")
+                return helper
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=intercept_import):
+            for unavailable in (False, True):
+                import_failure[0] = unavailable
+                initialized = namespace["AscendConfig"](vllm_config)
+                self.assertTrue(initialized.initialization_finished)
+                self.assertTrue(initialized.enable_sparse_li_c8)
+                self.assertEqual(initialized._sparse_li_c8_layer_ids, {2, 4})
+        self.assertEqual(len(calls), 1)
+
     def test_missing_or_wrong_target_refuses_without_partial_writes(self):
         cases = (
             (SFA_PATH, SFA_SOURCE.replace("class SFAIndexerMetadataBuilder:", "class UnrelatedBuilder:")),
@@ -201,6 +288,8 @@ class TestQliDispatchTraceInstaller(unittest.TestCase):
                 DEVICE_SOURCE.replace("sfa_impl, q_li, q_li_scale, q_li_shape_ori", "sfa_impl, q_li, q_li_shape_ori"),
             ),
             (DEVICE_PATH, None),
+            (CONFIG_PATH, CONFIG_SOURCE.replace("class AscendConfig:", "class OtherConfig:")),
+            (CONFIG_PATH, None),
         )
         for relative, invalid in cases:
             with self.subTest(relative=relative, invalid=invalid):
@@ -211,6 +300,35 @@ class TestQliDispatchTraceInstaller(unittest.TestCase):
                     path.unlink()
                 else:
                     path.write_text(invalid)
+                before = self.snapshot()
+                result = self.run_installer()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_selector_contract_changes_refuse_before_any_file_is_written(self):
+        filter_line = (
+            "        self._sparse_li_c8_layer_filter_enabled = self._has_sparse_li_c8_layer_config(quant_config)\n"
+        )
+        parse_start = "        (\n            self._sparse_li_c8_layer_ids,\n"
+        invalid_sources = (
+            CONFIG_SOURCE.replace(filter_line, ""),
+            CONFIG_SOURCE.replace(filter_line, filter_line * 2),
+            CONFIG_SOURCE.replace(
+                "_has_sparse_li_c8_layer_config(quant_config)\n", "_has_sparse_li_c8_layer_config(None)\n"
+            ),
+            CONFIG_SOURCE.replace(
+                "_parse_sparse_li_c8_layers_from_quant_config(quant_config)\n",
+                "_parse_sparse_li_c8_layers_from_quant_config(other_config)\n",
+            ),
+            CONFIG_SOURCE.replace("self._sparse_li_c8_layer_ids,", "self.unrelated_ids,"),
+            CONFIG_SOURCE.replace("self._sparse_li_c8_layer_names,", "self._sparse_li_c8_layer_ids,"),
+            CONFIG_SOURCE.replace(filter_line, "").replace(parse_start, filter_line + parse_start),
+            CONFIG_SOURCE.replace(filter_line, "        if True:\n    " + filter_line),
+            CONFIG_SOURCE.replace(filter_line, filter_line.rstrip() + "; self.extra = True\n"),
+        )
+        for invalid in invalid_sources:
+            with self.subTest(source=invalid):
+                (self.va_root / CONFIG_PATH).write_text(invalid)
                 before = self.snapshot()
                 result = self.run_installer()
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -2,8 +2,10 @@
 # QLI_DISPATCH_DEBUG_HELPER_V1
 """Opt-in worker diagnostics: Python dispatch evidence, never NPU execution proof."""
 
+import hashlib
 import inspect
 import json
+import marshal
 import os
 import sys
 
@@ -97,23 +99,146 @@ def _tensor(tensor):
 
 
 def _quant_description(cfg):
-    description = getattr(getattr(cfg.vllm_config, "quant_config", None), "quant_description", None)
+    return _quant_config_description(getattr(cfg.vllm_config, "quant_config", None))
+
+
+def _quant_config_description(quant_config):
+    description = getattr(quant_config, "quant_description", None)
     if not isinstance(description, dict):
         return None
-    groups = {}
+    groups, entries = {}, []
     for name, value in description.items():
         if not isinstance(name, str):
             continue
         suffix = next((s for s in (".indexer.quant_type", ".indexer.wq_b_weight") if name.endswith(s)), None)
         if suffix is None:
             continue
+        entries.append((name, value))
         # Quantization descriptions are JSON data. Never repr a non-JSON object.
         key = json.dumps([suffix, value], sort_keys=True)
         group = groups.setdefault(key, {"suffix": suffix, "value": value, "count": 0, "keys": []})
         group["count"] += 1
         if len(group["keys"]) < 3:
             group["keys"].append(name)
-    return {"indexer_quant_type": description.get("indexer_quant_type"), "groups": list(groups.values())}
+    return {
+        "indexer_quant_type": description.get("indexer_quant_type"),
+        "groups": list(groups.values()),
+        "indexer_entries_sha256": hashlib.sha256(json.dumps(sorted(entries), sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def _selector_cache(cfg):
+    return {
+        "filter_enabled": getattr(cfg, "_sparse_li_c8_layer_filter_enabled", None),
+        "layer_ids": sorted(getattr(cfg, "_sparse_li_c8_layer_ids", ())),
+        "layer_names": sorted(getattr(cfg, "_sparse_li_c8_layer_names", ())),
+    }
+
+
+def _parser_details(cfg):
+    parser = getattr(cfg, "_parse_sparse_li_c8_layers_from_quant_config", None)
+    code = getattr(_function(parser), "__code__", None)
+    labels = set()
+
+    def visit(value):
+        if isinstance(value, str) and value in ("FP8_DYNAMIC", "W8A8_MXFP8", "INT8_DYNAMIC"):
+            labels.add(value)
+        elif isinstance(value, (tuple, frozenset)):
+            for item in value:
+                visit(item)
+
+    if code is not None:
+        visit(code.co_consts)
+    return {
+        "source": _source(parser),
+        "code_sha256": hashlib.sha256(marshal.dumps(code)).hexdigest() if code is not None else None,
+        # Loaded code constants, not disk source and not proof of acceptance.
+        "quant_label_constants": sorted(labels),
+    }
+
+
+def report_selector_initialization(cfg, quant_config):
+    """Capture state immediately after the constructor saves its layer filter."""
+    try:
+        snapshot = {
+            "pid": os.getpid(),
+            "config_id": id(cfg),
+            "quant_config_id": id(quant_config),
+            "description_id": id(getattr(quant_config, "quant_description", None)),
+            "quant_description": _quant_config_description(quant_config),
+            "cached": _selector_cache(cfg),
+            "parser": _parser_details(cfg),
+        }
+        # Store a value snapshot, never references to mutable quantization data.
+        snapshot = json.loads(json.dumps(snapshot))
+        cfg._qli_selector_initialization = snapshot
+        _emit("selector_initialization", **snapshot)
+    except Exception as exc:
+        _error(cfg, "selector_initialization", exc)
+
+
+def _selection_diagnosis(cfg, instances):
+    """Read-only comparison; never refresh cache allocation or layer switches."""
+    result = {
+        "config_id": id(cfg),
+        "initialization": getattr(cfg, "_qli_selector_initialization", None),
+        "cached": _selector_cache(cfg),
+        "parser": _parser_details(cfg),
+    }
+    try:
+        quant_config = getattr(cfg.vllm_config, "quant_config", None)
+        result.update(
+            quant_config_id=id(quant_config),
+            description_id=id(getattr(quant_config, "quant_description", None)),
+        )
+        ids, names = cfg._parse_sparse_li_c8_layers_from_quant_config(quant_config)
+        fresh = {
+            "filter_enabled": cfg._has_sparse_li_c8_layer_config(quant_config),
+            "layer_ids": sorted(ids),
+            "layer_names": sorted(names),
+        }
+        result.update(fresh=fresh, fresh_matches_cached=fresh == result["cached"], layer_matches=[])
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        for name, impl in instances:
+            if not getattr(impl, "has_indexer", False):
+                continue
+            cache = getattr(getattr(impl, "indexer", None), "k_cache", None)
+            prefix = getattr(cache, "prefix", None)
+            match = {
+                "layer": getattr(impl, "layer_name", None) or name,
+                "prefix": prefix,
+                "has_indexer": True,
+                "impl_enabled": getattr(impl, "enable_sparse_li_c8", None),
+                "layer_id": None,
+                "current_layer_enabled": None,
+                "cached_name_match": False,
+                "cached_id_match": False,
+                "fresh_name_match": False,
+                "fresh_id_match": False,
+            }
+            try:
+                normalized = (prefix.rstrip(".") or None) if isinstance(prefix, str) else None
+                if normalized is None:
+                    match["error"] = {"type": "MissingCachePrefix", "message": "No nonempty Indexer cache prefix"}
+                    result["layer_matches"].append(match)
+                    continue
+                for label, selection in (("cached", result["cached"]), ("fresh", fresh)):
+                    match[f"{label}_name_match"] = any(
+                        normalized == candidate or normalized.startswith(f"{candidate}.")
+                        for candidate in selection["layer_names"]
+                    )
+                match["current_layer_enabled"] = cfg.is_sparse_li_c8_layer(prefix)
+                layer_id = extract_layer_index(normalized)
+                match["layer_id"] = layer_id
+                for label, selection in (("cached", result["cached"]), ("fresh", fresh)):
+                    match[f"{label}_id_match"] = layer_id is not None and layer_id in selection["layer_ids"]
+            except Exception as exc:
+                match["error"] = {"type": type(exc).__name__, "message": str(exc)[:240]}
+            result["layer_matches"].append(match)
+    except Exception as exc:
+        result["error"] = {"type": type(exc).__name__, "message": str(exc)[:240]}
+    return result
 
 
 def report_worker_dispatch(builder):
@@ -180,6 +305,7 @@ def report_worker_dispatch(builder):
             builder_quant_mode=getattr(builder, "quant_mode", None),
             note="Snapshot is not compute proof; compiled forwards may suppress entry hooks. Entry means attempt only.",
             config=config,
+            selection_diagnosis=_selection_diagnosis(cfg, instances.values()),
             modules={name: getattr(sys.modules.get(name), "__file__", None) for name in ("vllm_ascend", "ascend_vllm")},
             parser_sources={
                 name: _source(getattr(cfg, name, None))

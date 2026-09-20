@@ -94,9 +94,8 @@ Start GLM-5.2 or GLM-5.3 with these additional settings:
 contract. The configuration rejects MXFP4 on non-A5 devices and when LI C8 is
 disabled.
 
-For an existing deployment whose worker log shows `filter_enabled=true`,
-empty `layer_ids`, and model entries tagged `FP8_DYNAMIC`, update the layer
-selector in the actual deployment checkout:
+If the actual deployment's layer-selector allowlist lacks `FP8_DYNAMIC`,
+update it in the deployment checkout:
 
 ```bash
 git -C /workspace/vllm-ascend-glm-mxfp4 pull --ff-only && \
@@ -111,20 +110,22 @@ other edits and diagnostic hooks, and performs no compilation or installation.
 New installs already include the correction in the deployment patch.
 
 Restart all service workers after applying it: layer selection and cache
-allocation are established at initialization. The reported A5 worker logs
-showed that the patched VA methods were active, but all 22 Indexer instances
-had quantization disabled because none of the 16 `FP8_DYNAMIC` entries passed
-the old allowlist. Metadata used the global mode while compute used the
-per-layer flag, explaining why V2 metadata coexisted with BF16 LightningIndexer
-compute. The fix retains configured layer exclusions; it does not force every
-Indexer layer to MXFP4. Verify that matching layers are selected and enter
-mode 5 after restart. Local selector tests do not establish A5 compute or
-end-to-end accuracy.
+allocation are established at initialization. The reported A5 logs confirmed
+that patched VA methods were active, the cached layer selection was empty,
+and all 22 Indexer instances had quantization disabled. Metadata used the
+global mode while compute used the per-layer flag, explaining V2 metadata
+alongside BF16 LightningIndexer compute. However, an empty cached selection
+does not prove that the running parser omitted `FP8_DYNAMIC`: the user also
+reported source containing that label. The compatibility fix is a no-op on
+that source and is not a confirmed resolution of this deployment issue.
+It retains configured layer exclusions. Local tests do not establish A5
+compute or end-to-end accuracy.
 
 If profiling still shows the old LightningIndexer after restarting, install
 temporary worker diagnostics in the **already patched deployment checkout**:
 
 ```bash
+git -C /workspace/vllm-ascend-glm-mxfp4 pull --ff-only && \
 python3 -I /workspace/vllm-ascend-glm-mxfp4/tools/trace_qli_dispatch.py
 ```
 
@@ -143,6 +144,31 @@ file/line of the bound compute methods and their `DeviceOperator`. Methods
 outside the community VA package also include a bounded source excerpt, when
 available, to help identify AV overrides. Instances with identical settings
 and methods are grouped; representative names and total counts are reported.
+
+The `selector_initialization` event captures input summaries, loaded parser
+code fingerprints, and the saved filter immediately after the constructor
+saves the layer filter.
+`worker_snapshot.selection_diagnosis` then compares that snapshot and cached
+selection against a read-only reparse of the current quantization config.
+`layer_matches` reports every Indexer instance's actual cache prefix, name/ID
+matches against both selections, the current selector result, and its saved
+implementation flag. This separates configuration parsing from layer matching:
+
+- Empty cached IDs with nonempty fresh IDs prove a mismatch between cached
+  selection and current parsing. Compare initialization/current input and code
+  fingerprints before attributing it to load order, code replacement, or a
+  later overwrite; the mismatch alone cannot identify the cause.
+- Nonempty IDs but neither a name nor an ID match point to layer matching.
+  A prefix difference alone is not a failure when the layer-ID fallback matches.
+- A true current selector result with a false implementation flag points to
+  a difference between the layer's saved gate and current configuration.
+
+`quant_label_constants` comes from the loaded function's bytecode, not source
+currently on disk. It is evidence about embedded labels, not proof of the
+acceptance rule. The diagnostics never replace cached selections, change
+quantization, or reallocate caches. Initialization events may occur in both
+parent and worker processes; compare PID and configuration identity as well
+as content. All diagnostic state consists of value snapshots.
 
 `device_entry` and `compute_entry` records identify entry into the instrumented
 Python methods; they do not prove successful ACLNN/device execution. These
