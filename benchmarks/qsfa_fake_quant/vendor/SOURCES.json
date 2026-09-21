@@ -1,0 +1,30 @@
+{
+  "repository": "https://gitcode.com/cann/ops-transformer",
+  "ref": "55498d91634277d4eec912499c027818a8c167fb",
+  "license": "CANN Open Software License Agreement Version 2.0",
+  "license_file": "LICENSE",
+  "source_file": "attention/kv_quant_sparse_flash_attention/tests/pytest/kv_quant_sparse_flash_attention_golden.py",
+  "source_sha256": "5649f0b8dd9fa5cc9bb9d8f63c6816646410d1217ae61c7d2f19126c1f6ad19c",
+  "vendored_file": "official_qsfa_golden.py",
+  "functions": {
+    "gatherKV": {
+      "start_line": 866,
+      "end_line": 914,
+      "sha256": "94314c40440db17847b350163c3490345c33d178b2d4c11317860b846251fcb5"
+    },
+    "softmax": {
+      "start_line": 917,
+      "end_line": 924,
+      "sha256": "56e29f34c527ca44ff95f83e5328481eff56a4b8c3e93bc9916a06156172e69b"
+    },
+    "_t_increattention_bnsd": {
+      "start_line": 927,
+      "end_line": 1011,
+      "sha256": "d7ec58175cf0a1636bbb8ba8bd1f73daf9c542a599773e8045add0683b7900a9"
+    }
+  },
+  "changes": "Function bodies copied verbatim; unused imports and generator dependency omitted. Header and license retained.",
+  "native_call_source": "attention/kv_quant_sparse_flash_attention/examples/test_npu_kv_quant_sparse_flash_attention.py",
+  "native_case_changes": "B=1,Q=1,Nq=8,Nkv=1,K=8192, sparse=2048; bounded Q/RoPE in [-1,1], INT8 payload in [-100,100], constant positive FP32 dequant scale 0.01; identity block table.",
+  "baseline": "Native INT8 combined-PA QSFA correctness only, not MXFP4/C4 kernel execution or performance."
+}

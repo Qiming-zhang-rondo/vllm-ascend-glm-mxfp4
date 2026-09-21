@@ -244,3 +244,4 @@ qli_a5_*.log
 qli_a5_*.json
 .qli-official/
 qli_timeout_diagnostic.json
+.qsfa-fake-quant/
