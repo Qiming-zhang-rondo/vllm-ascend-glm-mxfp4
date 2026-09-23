@@ -17,7 +17,7 @@ import torch
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "benchmarks"))
 from qsfa_fake_quant import official_baseline, reference  # noqa: E402
-from qsfa_fake_quant.run import evaluate_inputs  # noqa: E402
+from qsfa_fake_quant.run import evaluate_inputs, parse_args  # noqa: E402
 
 
 class QsfaReferenceTests(unittest.TestCase):
@@ -88,7 +88,12 @@ class QsfaReferenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reference.validate_inputs(q, kv, indices, scale)
 
-    def test_cli_replay_persists_failed_gates_without_claiming_hardware(self):
+    def test_native_execution_requires_explicit_opt_in(self):
+        for flags, reference_only in (([], True), (["--reference-only"], True), (["--native-baseline"], False)):
+            with self.subTest(flags=flags), mock.patch.object(sys, "argv", ["qsfa", *flags]):
+                self.assertEqual(parse_args().reference_only, reference_only)
+
+    def test_default_cli_replay_persists_failed_gates_without_importing_npu(self):
         q, kv, indices, scale = reference.synthetic_inputs(1, 7, 2, 5, 18)
         with tempfile.TemporaryDirectory() as temp:
             source, output = Path(temp) / "inputs.pt", Path(temp) / "result.json"
@@ -97,10 +102,9 @@ class QsfaReferenceTests(unittest.TestCase):
                 sys.executable,
                 "-I",
                 "-c",
-                "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
+                "import runpy,sys;sys.modules['torch_npu']=None;sys.path.insert(0,sys.argv.pop(1));"
                 'runpy.run_module("qsfa_fake_quant.run",run_name="__main__")',
                 str(REPO / "benchmarks"),
-                "--reference-only",
                 "--input",
                 str(source),
                 "--min-cosine",

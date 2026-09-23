@@ -24,7 +24,15 @@ from .reference import (
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reference-only", action="store_true", help="CPU simulation only; skip native QSFA gate")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--reference-only", action="store_true", help="CPU simulation only (default)")
+    mode.add_argument(
+        "--native-baseline",
+        action="store_false",
+        dest="reference_only",
+        help="Opt in to the separate native INT8 QSFA gate before CPU simulation; requires an NPU",
+    )
+    parser.set_defaults(reference_only=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--query-tokens", type=int, default=1)
     parser.add_argument("--key-tokens", type=int, default=8192)
@@ -133,7 +141,10 @@ def main():
     write_report(args.output, report)
     try:
         if args.reference_only:
-            report["native_baseline"] = {"status": "skipped", "reason": "Explicit --reference-only"}
+            report["native_baseline"] = {
+                "status": "skipped",
+                "reason": "CPU simulation; native QSFA requires explicit --native-baseline",
+            }
             print("REFERENCE ONLY: no NPU operator is executed", flush=True)
         else:
             report["stage"] = "native INT8 QSFA baseline"

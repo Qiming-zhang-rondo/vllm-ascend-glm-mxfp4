@@ -1,18 +1,20 @@
 # QSFA 单算子低精度实验
 
-先验证低精度组合的数值误差。复用容器现有 Python、torch、torch_npu 和 CANN；没有 pip 安装、编译、框架 patch 或模型启动。
+默认只在 CPU 上验证低精度组合的数值误差，复用现有 Python 和 torch。没有 pip 安装、编译、框架 patch 或模型启动，也不需要 NPU、torch_npu 或 CANN。
 
 ## 一条命令
 
-在已激活 PyTorch 环境的 A5 容器内运行：
+在已激活 PyTorch 环境的终端运行，A3/A5 容器或有 CPU torch 的机器均可：
 
 ```bash
 git -C /workspace/vllm-ascend-glm-mxfp4 pull --ff-only && bash /workspace/vllm-ascend-glm-mxfp4/benchmarks/qsfa_fake_quant/run_qsfa.sh
 ```
 
-脚本先调用现有 `torch_npu.npu_kv_quant_sparse_flash_attention` 做一组 **INT8 cache / BF16 Q** 的原生正确性基线。通过后，在 CPU reference 上运行低精度伪量化实验。当前官方 QSFA 没有待测的 C4/Q8/P8/O8 compute 接口，因此不会把这些伪量化案例伪装成真实低精度 NPU kernel。
+脚本直接在 CPU reference 上运行低精度伪量化实验，默认不调用任何 NPU 算子。当前官方 QSFA 没有待测的 C4/Q8/P8/O8 compute 接口，因此不会把这些伪量化案例伪装成真实低精度 NPU kernel。
 
-若只想运行精度模拟，可添加 `--reference-only`，不需要 NPU 或 torch_npu。也可将 `--python /path/to/python` 作为脚本的第一组参数指定容器现有解释器。脚本使用独立 Python 导入路径，避免仓库 `tools/bisect` 等文件遮蔽标准库，并在 Python 启动前关闭已知的 FLA `.pth` 注入。
+`--reference-only` 仍可使用，与默认行为相同。也可将 `--python /path/to/python` 作为脚本的第一组参数指定现有解释器。脚本使用独立 Python 导入路径，避免仓库 `tools/bisect` 等文件遮蔽标准库，并在 Python 启动前关闭已知的 FLA `.pth` 注入。
+
+仅在专门排查原生 QSFA 时显式添加 `--native-baseline`：它会先执行一组 **INT8 cache / BF16 Q** 的 NPU 正确性基线，需现有 torch_npu 和 CANN。2026-09-23 的 A5 用户运行在该原生调用处发生 507014 AI Core timeout，CPU 伪量化尚未开始；超时根因未确认。该原生检查不是数值模拟的必要前提，默认已移除。保留当次 `plog/` 供后续排查，无需为本实验重复运行失败的原生基线。
 
 默认形状：单序列、Q=1、KV=8192、单卡本地 Q heads=8、KV heads=1、NoPE=512、RoPE=64、选中 KV=2048。合成实验运行三个固定 seed，Q/K 源数据为标准正态分布后转 BF16，attention scale 为 `1/sqrt(576)`。这不是采自 GLM 的真实张量。
 
@@ -55,7 +57,7 @@ bash /workspace/vllm-ascend-glm-mxfp4/benchmarks/qsfa_fake_quant/run_qsfa.sh --h
 
 **本实验不报告伪量化的性能加速比。** `performance.measured=false`：CPU 模拟速度和新 NPU kernel 的性能没有可比性。没有加载模型，也没有测试端到端精度。
 
-本地 CPU 默认三 seed 的初步结果：C4 vs BF16 的 relative RMSE 约 10.5%～10.9%，超过暂定 10% 门槛；Q8+C4+O8 vs C4 约 4.3%，加入 P8 后约 4.8%～5.0%。保留失败结果，不为通过而修改阈值。A5 原生 baseline 尚待容器实测。
+本地 CPU 默认三 seed 的初步结果：C4 vs BF16 的 relative RMSE 约 10.5%～10.9%，超过暂定 10% 门槛；Q8+C4+O8 vs C4 约 4.3%，加入 P8 后约 4.8%～5.0%。保留失败结果，不为通过而修改阈值。A5 原生 baseline 本次未通过，不能据此宣称验证了原生算子。
 
 ## 可选：重放实际输入
 
