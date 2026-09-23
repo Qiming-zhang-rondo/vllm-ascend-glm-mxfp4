@@ -2,6 +2,8 @@
 
 默认只在 CPU 上验证低精度组合的数值误差，复用现有 Python 和 torch。没有 pip 安装、编译、框架 patch 或模型启动，也不需要 NPU、torch_npu 或 CANN。
 
+后续的真实 Ascend C Q8/C4/O8 设备原型已放在 [qsfa_q8c4_o8](../qsfa_q8c4_o8/README.md)，使用独立编译/测试入口，尚待 A5 验证。本目录继续保留 CPU 伪量化行为。
+
 ## 一条命令
 
 在已激活 PyTorch 环境的终端运行，A3/A5 容器或有 CPU torch 的机器均可：
