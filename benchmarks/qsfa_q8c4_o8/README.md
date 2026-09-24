@@ -88,4 +88,6 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 加载修复本地验证：49项及31个子测试通过，包含实际编译、链接、运行 CPU libtorch 的 C++ Dispatcher 测试（ND接受、NZ拒绝、int64返回值、schema缺失及随后注册），以及加载失败时不生成成功 manifest 的回归。该测试没有 torch_npu/A5，不代表设备验证。
 
+随后用户提供的 `link.txt` 确认本容器使用 ASC CMake 编译 `.asc`、使用 `/usr/bin/c++` 最终链接，而不是直接 bisheng 后备路径，因此没有 `toolchain_probe.log`。原链接命令缺少 Ascend C runtime 的完整依赖；容器内 `libprofapi.so` 导出 `MsprofReportApi`，`libmmpa.so` 导出 `mmGetTid`，库本身不缺失。构建现按 [CANN 9.1 内置库清单](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/programug/Ascendcopdevg/docs/en/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation_basic_usage.md) 显式链接静态 `ascendc_runtime` 及其后的共享依赖 `runtime/profapi/unified_dlog/mmpa/ascend_dump/c_sec/error_manager/ascendcl`。两条构建路径使用同一列表，保留未定义符号检查及构建后的真实加载检查，不通过忽略链接错误来绕过问题。
+
 **待 A5 验证**：本次加载修复、MX NoPE→BF16 RoPE连续累加、完整数值结果、设备任务和 wall 性能。尚未支持 torch.compile/ACLGraph、prefill、多batch、框架接入或端到端模型验证。包含 CANN 派生代码的 `csrc/matmul.asc` 保留 CANN2.0许可，见 `CANN_LICENSE`。

@@ -16,7 +16,7 @@ function(qsfa_direct_objects output)
     execute_process(
         COMMAND "${QSFA_BISHENG}" -shared "${CMAKE_CURRENT_SOURCE_DIR}/cmake/toolchain_probe.asc"
             -o "${CMAKE_CURRENT_BINARY_DIR}/toolchain_probe.so" ${flags} ${link_flags}
-            "${ASCENDCL_LIBRARY}" "${ASCENDC_RUNTIME_LIBRARY}" -Wl,--no-undefined
+            ${QSFA_CANN_RUNTIME_LIBRARIES} -Wl,--no-undefined
         RESULT_VARIABLE probe_result OUTPUT_VARIABLE probe_stdout ERROR_VARIABLE probe_stderr)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/toolchain_probe.log" "${probe_stdout}\n${probe_stderr}")
     if(NOT probe_result EQUAL 0 OR NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/toolchain_probe.so")

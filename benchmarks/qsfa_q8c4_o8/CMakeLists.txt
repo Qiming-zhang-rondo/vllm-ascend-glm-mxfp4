@@ -39,10 +39,9 @@ endif()
 set(CANN_LIBRARY_DIRS "${ASCEND_HOME_PATH}/lib64"
     "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
     "${ASCEND_HOME_PATH}/aarch64-linux/lib64" "${ASCEND_HOME_PATH}/arm64-linux/lib64"
-    "${ASCEND_HOME_PATH}/toolkit/lib64")
+    "${ASCEND_HOME_PATH}/toolkit/lib64" "${ASCEND_HOME_PATH}/runtime/lib64")
 find_library(TORCH_NPU_LIBRARY torch_npu PATHS "${TORCH_NPU_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
-find_library(ASCENDCL_LIBRARY ascendcl PATHS ${CANN_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
-find_library(ASCENDC_RUNTIME_LIBRARY ascendc_runtime PATHS ${CANN_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+include(cmake/cann_runtime.cmake)
 
 set(QSFA_CANN_INCLUDES
     "${ASCEND_HOME_PATH}/include"
@@ -78,7 +77,7 @@ target_compile_options(qsfa_q8c4_o8 PRIVATE ${TORCH_ABI_FLAGS}
     $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=dav-3510>
     $<$<COMPILE_LANGUAGE:ASC>:-O2>)
 target_link_libraries(qsfa_q8c4_o8 PRIVATE ${TORCH_LIBRARIES} "${TORCH_NPU_LIBRARY}"
-    "${ASCENDCL_LIBRARY}" "${ASCENDC_RUNTIME_LIBRARY}" dl)
+    ${QSFA_CANN_RUNTIME_LIBRARIES} dl)
 target_link_options(qsfa_q8c4_o8 PRIVATE -Wl,--no-undefined)
 set_target_properties(qsfa_q8c4_o8 PROPERTIES BUILD_RPATH
     "${TORCH_NPU_ROOT}/lib;${TORCH_INSTALL_PREFIX}/lib;${CANN_LIBRARY_DIRS}")
