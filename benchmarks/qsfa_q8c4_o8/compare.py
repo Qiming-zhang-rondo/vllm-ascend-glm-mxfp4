@@ -51,6 +51,10 @@ def reject_nonfinite_json(value):
 def freeze_inputs(args):
     query, kv, indices, scale = load_inputs(args)
     validate_logical_inputs(query, kv, indices, scale)
+    if args.implementation == "official":
+        from benchmarks.qsfa_q8c4_o8.official_inputs import validate_head_count
+
+        validate_head_count(query)
     query = query.detach().to(dtype=torch.bfloat16).contiguous().clone()
     kv = kv.detach().to(dtype=torch.bfloat16).contiguous().clone()
     indices = indices.to(dtype=torch.int32).contiguous().clone()
@@ -69,7 +73,7 @@ def freeze_inputs(args):
         "indices_shape": list(indices.shape),
         "source_dtype": "bfloat16",
         "scale_value": float(scale),
-        "contract": "Both workers read this same frozen logical input; each prepares its own cache representation",
+        "contract": "All workers read this same frozen logical input; each prepares its own cache representation",
     }
 
 
@@ -128,13 +132,32 @@ def validate_worker(result, returncode, variant):
             raise RuntimeError(f"{variant} has invalid positive finite latency {key}={value!r}")
 
 
+def latency_comparison(candidate, baseline):
+    """Return same-scope ratios, retaining negative gains for slower candidates."""
+    cp, bp = candidate["performance"], baseline["performance"]
+    return {
+        "available": True,
+        "candidate_p50_ms": cp["p50_ms"],
+        "baseline_p50_ms": bp["p50_ms"],
+        "p50_speedup_ratio": bp["p50_ms"] / cp["p50_ms"],
+        "p50_latency_reduction_percent": (1.0 - cp["p50_ms"] / bp["p50_ms"]) * 100.0,
+        "candidate_mean_ms": cp["mean_ms"],
+        "baseline_mean_ms": bp["mean_ms"],
+        "mean_speedup_ratio": bp["mean_ms"] / cp["mean_ms"],
+        "mean_latency_reduction_percent": (1.0 - cp["mean_ms"] / bp["mean_ms"]) * 100.0,
+        "interpretation": "Ratio <1 and negative latency reduction mean the candidate is slower",
+        "scope": "Full synchronized operator wall calls; see each report for included stages and cache dtype",
+    }
+
+
 def run(args):
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     candidate_path = args.output.parent / "candidate.json"
     baseline_path = args.output.parent / "native_baseline.json"
-    if args.output in (candidate_path, baseline_path):
-        raise ValueError("Comparison --output must differ from candidate.json and native_baseline.json")
+    control_path = args.output.parent / "official_source_control.json"
+    if args.output in (candidate_path, baseline_path, control_path):
+        raise ValueError("Comparison --output must differ from per-worker report paths")
     report = {
         "schema_version": 1,
         "status": "running",
@@ -145,6 +168,15 @@ def run(args):
         "differing_cache_types": True,
         "comparison": {"available": False},
     }
+    if args.implementation == "official":
+        report["source_control_comparison"] = {"available": False}
+        report["official_pipeline_scope"] = {
+            "execution_order": ["source_control", "candidate", "native"],
+            "source_control": "Same pinned official source: BF16 Q/O, FP8 D128 FP32 cache, 1 AIC, FD=0, S2=128",
+            "candidate": "Adapted official source: Q8/C4/O8, 1 AIC, FD=0, S2=64",
+            "same_source_does_not_mean_same_tiling": True,
+            "installed_native_tiling_equivalence_claimed": False,
+        }
     write_report(args.output, report)
     try:
         torch.set_num_threads(args.threads)
@@ -152,10 +184,13 @@ def run(args):
         snapshot = Path(report["shared_input"]["path"])
         expected_hash = report["shared_input"]["sha256"]
         write_report(args.output, report)
-        for variant, role, output in (
+        workers = [
             ("candidate", "candidate", candidate_path),
             ("native", "baseline", baseline_path),
-        ):
+        ]
+        if args.implementation == "official":
+            workers.insert(0, ("source_control", "source_control", control_path))
+        for variant, role, output in workers:
             if input_digest(snapshot) != expected_hash:
                 raise RuntimeError("Shared input snapshot changed before worker launch")
             # A crashed child must never be mistaken for a successful stale run.
@@ -182,23 +217,22 @@ def run(args):
         baseline = report["baseline"]["result"]
         cp, bp = candidate["performance"], baseline["performance"]
         report["comparison"] = {
-            "available": True,
-            "candidate_p50_ms": cp["p50_ms"],
-            "baseline_p50_ms": bp["p50_ms"],
-            "p50_speedup_ratio": bp["p50_ms"] / cp["p50_ms"],
-            "p50_latency_reduction_percent": (1.0 - cp["p50_ms"] / bp["p50_ms"]) * 100.0,
-            "candidate_mean_ms": cp["mean_ms"],
-            "baseline_mean_ms": bp["mean_ms"],
-            "mean_speedup_ratio": bp["mean_ms"] / cp["mean_ms"],
-            "mean_latency_reduction_percent": (1.0 - cp["mean_ms"] / bp["mean_ms"]) * 100.0,
-            "interpretation": "Ratio <1 and negative latency reduction mean the candidate is slower",
-            "scope": "Full synchronized operator wall calls; see each report for included stages and cache dtype",
+            **latency_comparison(candidate, baseline),
             "candidate_contract": f"Q8/MXFP4 cache/O8 custom {args.implementation}",
             "baseline_contract": "Installed native QSFA; its cache/output contract is recorded in the baseline report",
         }
+        if args.implementation == "official":
+            report["source_control_comparison"] = {
+                **latency_comparison(candidate, report["source_control"]["result"]),
+                "candidate_contract": "Official-source Q8/C4/O8 adaptation, 1 AIC, FD=0, S2=64",
+                "baseline_contract": "Official-source unchanged BF16-Q/O FP8-KV control, 1 AIC, FD=0, S2=128",
+                "identical_tiling": False,
+            }
         report["compute_verified"] = True
         report["status"] = (
-            "quantization_failed" if "quantization_failed" in (candidate["status"], baseline["status"]) else "passed"
+            "quantization_failed"
+            if any(report[role]["result"]["status"] == "quantization_failed" for _, role, _ in workers)
+            else "passed"
         )
         report["stage"] = "complete"
         write_report(args.output, report)
@@ -211,6 +245,15 @@ def run(args):
             f"(operator wall time, differing cache types; status={report['status']})",
             flush=True,
         )
+        if args.implementation == "official":
+            control_comparison = report["source_control_comparison"]
+            print(
+                "SOURCE_CONTROL_COMPARISON: "
+                f"p50 speedup={control_comparison['p50_speedup_ratio']:.3f}x; "
+                f"latency reduction={control_comparison['p50_latency_reduction_percent']:+.2f}% "
+                "(same source, different cache/compute and S2 tile; not installed-native tiling equivalence)",
+                flush=True,
+            )
         return 0 if report["status"] == "passed" else 1
     except Exception as exc:
         report["status"] = "failed"
@@ -223,7 +266,7 @@ def run(args):
 def main(argv=None):
     args = parse_args(argv)
     if getattr(args, "variant", "candidate") != "candidate":
-        print("--variant native is a worker option; comparison always runs candidate then native", file=sys.stderr)
+        print("--variant is a worker option; comparison chooses all required workers", file=sys.stderr)
         return 2
     return run(args)
 

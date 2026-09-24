@@ -11,10 +11,16 @@ task_build_only=0
 task_jobs=4
 task_runner=benchmarks.qsfa_q8c4_o8.compare
 task_run_args=()
+task_implementation=tiled
 while (($#)); do
     case "$1" in
         --build-only) task_build_only=1; shift ;;
         --candidate-only) task_runner=benchmarks.qsfa_q8c4_o8.run; shift ;;
+        --implementation)
+            (($# >= 2)) || { echo '--implementation requires a value' >&2; exit 2; }
+            task_implementation=$2; task_run_args+=("$1" "$2"); shift 2 ;;
+        --implementation=*)
+            task_implementation=${1#*=}; task_run_args+=("$1"); shift ;;
         --python)
             (($# >= 2)) || { echo '--python requires an executable' >&2; exit 2; }
             task_python=$2; shift 2 ;;
@@ -24,6 +30,14 @@ while (($#)); do
         *) task_run_args+=("$1"); shift ;;
     esac
 done
+task_build_args=(--jobs "$task_jobs")
+if [[ $task_implementation == official ]]; then
+    task_build_args+=(--official)
+    if [[ $task_runner == benchmarks.qsfa_q8c4_o8.run && $task_build_only == 0 ]]; then
+        echo 'The official path requires its source-control case first; omit --candidate-only.' >&2
+        exit 2
+    fi
+fi
 [[ $(uname -s) == Linux ]] || { echo 'Run inside the existing A5 Linux container.' >&2; exit 2; }
 task_run_dir="$task_dir/.runs/$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$task_run_dir/plog"
@@ -45,7 +59,7 @@ sys.modules["benchmarks"]=package
 sys.argv=[module,*args]
 runpy.run_module(module,run_name="__main__")'
 "$task_python" -I -c "$task_bootstrap" "$task_repo" benchmarks.qsfa_q8c4_o8.build \
-    --jobs "$task_jobs" --result-file "$task_run_dir/build.json"
+    --result-file "$task_run_dir/build.json" "${task_build_args[@]}"
 task_library=$("$task_python" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["library"])' "$task_run_dir/build.json")
 if ((task_build_only)); then
     echo "Build complete; library: $task_library"

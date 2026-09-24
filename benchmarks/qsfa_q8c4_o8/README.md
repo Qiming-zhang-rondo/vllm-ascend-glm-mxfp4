@@ -2,6 +2,52 @@
 
 这是 **Ascend C 设备代码**，通过独立 Torch `.so` 执行。现在包含两条路径：默认 `tiled` 为三个 kernel 分块版本，动态 UB 预留修正后已在用户 A5 完成默认 shape 的计算正确性与同步 wall 耗时验证；`prototype` 为原来的五个 kernel 版本，也已完成同类验证。两者都是独立原型，不是官方 QSFA 源码增量修改版，量化筛选仍失败。后续采用[官方源码融合改造路线](OPTIMIZATION_REVIEW.md#已选定的开发路线)，该新路径尚未实现。只做单算子；没有修改 VA/AV、模型或现有 CANN OPP。
 
+## Official fused-source adaptation (experimental)
+
+Use this mode for the new official-kernel derivative:
+
+```bash
+git -C /workspace/qsfa-a5-optest pull --ff-only && bash /workspace/qsfa-a5-optest/benchmarks/qsfa_q8c4_o8/run_qsfa.sh --implementation official
+```
+
+This compiles the pinned CANN fused QSFA pipeline with two isolated entries:
+its original BF16 Q/output + FP8 cache control, and the Q8/C4/O8 derivative.
+The script first verifies the source control, then the candidate, then the
+container's installed `npu_kv_quant_sparse_flash_attention`, all in fresh
+processes with the same logical inputs. A control compute failure stops the
+run before the candidate. Quantization-loss failures remain failures even
+if compute and timing finish. Existing `tiled` and `prototype` modes remain
+available; the default remains `tiled` until the new path passes A5 validation.
+
+The candidate keeps official sparse PA access, triple L1 buffering, pipelined
+QK/online softmax/PV, and cross-core synchronization. It modifies the producer
+and consumers rather than invoking the independent `tiled` kernels. No full
+expanded K/V, score matrix or probability matrix is written to GM. NoPE QK
+uses native MXFP8 `LoadData`/`Mmad` with lossless C4-to-FP8 expansion and original
+E8M0 scales. RoPE QK and PV stay BF16, accumulators stay FP32, and final FP32
+normalization feeds D32 O8 directly. See [source contract](official/README.md)
+and [upstream delta](official/changes.patch).
+
+Initial scope: Q=1, H=8/16/32, D=512+64, selected tokens in 128..8192 and
+divisible by128, one KV head/sequence, PA256, no mask holes or split-KV.
+The default remains Q1/H8/K8192/selected2048. The source control uses S2=128;
+the candidate uses64 to fit separate MX-QK and BF16-PV operands. Both use one
+AIC/two AIVs. These are explicit experiment specializations; the installed
+CANN binary's tiling is not inferred from a matching API name.
+
+Results contain `comparison` against installed CANN and a separate
+`source_control_comparison`. Both are **synchronized operator wall times**,
+including host preparation/allocations, status initialization, dispatch and
+completion synchronization. Packing, golden, H2D, warmup and readback remain
+outside timing. Add `--profile` for actual device task durations; do not treat
+the wall ratios as pure kernel speedup or model performance.
+
+Local validation covers actual host C++/packing/math and test orchestration.
+This new derivative has **not yet been compiled or executed on A5**. It does
+not claim a speedup or remove the earlier quantization screening failure.
+It only builds an isolated test library; installed CANN/OPP/VA are unchanged,
+and the script performs no dependency installation or download.
+
 ## 在现有 A5 容器中执行
 
 激活已有 PyTorch/CANN 环境后运行：

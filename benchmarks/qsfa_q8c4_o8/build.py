@@ -94,15 +94,18 @@ def _toolchain_options(config, compiler):
     return [f"-DASC_DIR={config.parent}", *options]
 
 
-def _verify_library_load(torch, library):
+def _verify_library_load(torch, library, *, official=False):
     """Resolve host symbols/register schemas only; never dispatch a kernel."""
     print("Checking QSFA shared-library load and registration (no NPU execution)", flush=True)
     torch.ops.load_library(str(library))
     _ = torch.ops.qsfa_q8c4_o8.forward
     _ = torch.ops.qsfa_q8c4_o8.forward_tiled
+    if official:
+        _ = torch.ops.qsfa_q8c4_o8.forward_official
+        _ = torch.ops.qsfa_q8c4_o8.forward_official_fp8
 
 
-def build_library(jobs=4, *, _remaining_compilers=None):
+def build_library(jobs=4, *, official=False, _remaining_compilers=None):
     """Return a JSON-safe library manifest after an offline build or cache hit."""
     if platform.system() != "Linux":
         raise RuntimeError("Build this prototype inside the existing A5 Linux container; no container will be created")
@@ -134,6 +137,8 @@ def build_library(jobs=4, *, _remaining_compilers=None):
     for name in ("vector.asc", "matmul.asc", "tiled.asc", "tiled_layout.h", "torch_binding.cpp", "launch.h"):
         if not (ROOT / "csrc" / name).is_file():
             raise RuntimeError(f"Incomplete prototype source: csrc/{name}")
+    if official:
+        sources += sorted(file for file in (ROOT / "official").rglob("*") if file.is_file())
     compiler_paths = []
     for name in ("c++", "bisheng", "ccec"):
         found = shutil.which(name)
@@ -156,6 +161,7 @@ def build_library(jobs=4, *, _remaining_compilers=None):
     dependencies = [_file_identity(npu_root / "include" / name) for name in required]
     dependencies += [_file_identity(file) for file in (npu_root / "lib").glob("libtorch_npu.so*")]
     identity = {
+        "official_fused": official,
         "python": _file_identity(sys.executable),
         "torch": str(torch.__version__),
         "torch_path": str(Path(torch.__file__).resolve()),
@@ -183,7 +189,7 @@ def build_library(jobs=4, *, _remaining_compilers=None):
             old.get("fingerprint") == fingerprint
             and old.get("library_sha256") == hashlib.sha256(library.read_bytes()).hexdigest()
         ):
-            _verify_library_load(torch, library)
+            _verify_library_load(torch, library, official=official)
             print(f"Reusing standalone QSFA library: {library}", flush=True)
             return {**old, "reused": True}
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -200,6 +206,7 @@ def build_library(jobs=4, *, _remaining_compilers=None):
         f"-DASCEND_HOME_PATH={cann}",
         *_toolchain_options(asc_config, compiler),
         "-DCMAKE_BUILD_TYPE=Release",
+        f"-DQSFA_BUILD_OFFICIAL={'ON' if official else 'OFF'}",
     ]
     (build_dir / "toolchain_probe.failed").unlink(missing_ok=True)
     try:
@@ -209,12 +216,12 @@ def build_library(jobs=4, *, _remaining_compilers=None):
         # retry a failed native syntax/link probe, never an actual kernel build.
         if asc_config is None and (build_dir / "toolchain_probe.failed").is_file() and len(compilers) > 1:
             print(f"Trying another installed compiler from the same CANN root: {compilers[1]}", flush=True)
-            return build_library(jobs, _remaining_compilers=compilers[1:])
+            return build_library(jobs, official=official, _remaining_compilers=compilers[1:])
         raise
     subprocess.run([cmake, "--build", str(build_dir), "--parallel", str(jobs)], check=True)
     if not library.is_file():
         raise RuntimeError(f"Build returned success but library is absent: {library}")
-    _verify_library_load(torch, library)
+    _verify_library_load(torch, library, official=official)
     result = {
         "library": str(library),
         "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
@@ -229,10 +236,11 @@ def build_library(jobs=4, *, _remaining_compilers=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--official", action="store_true", help="Also build pinned official fused control/candidate")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--result-file", type=Path)
     args = parser.parse_args()
-    result = build_library(args.jobs)
+    result = build_library(args.jobs, official=args.official)
     if args.result_file:
         args.result_file.parent.mkdir(parents=True, exist_ok=True)
         args.result_file.write_text(json.dumps(result, indent=2) + "\n")

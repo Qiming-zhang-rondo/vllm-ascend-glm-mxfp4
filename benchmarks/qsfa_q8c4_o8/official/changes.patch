@@ -1,0 +1,300 @@
+--- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_common_arch35.h
++++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_common_arch35.h
+@@ -15,6 +15,7 @@
+ #ifndef KV_QUANT_SPARSE_FLASH_ATTENTION_COMMON_ARCH35_H
+ #define KV_QUANT_SPARSE_FLASH_ATTENTION_COMMON_ARCH35_H
+ #include <type_traits>
++#include "q8c4_layout.h"
+ #include "kernel_tiling/kernel_tiling.h"
+
+ #if __has_include("../../sparse_flash_attention/arch35/common/util_regbase.h")
+--- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_kernel_mla_arch35.h
++++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_kernel_mla_arch35.h
+@@ -177,7 +177,7 @@
+     }
+
+     constInfo.s1BaseSize = 64;
+-    constInfo.s2BaseSize = 128;
++    constInfo.s2BaseSize = QSFA_Q8C4_CANDIDATE ? qsfa_q8c4_layout::N : 128;
+
+     this->pipe = tPipe;
+     vecBlock.InitVecBlock(tPipe, this->tilingData, this->sharedParams, this->aicIdx, constInfo.subBlockIdx,
+@@ -399,13 +399,17 @@
+     vecBlock.InitGlobalBuffer(key, value, sparseIndices, blockTable);
+ #endif
+     cubeBlock.InitCubeInput(actualSeqLengthsQ, constInfo);
++#if QSFA_Q8C4_CANDIDATE
++    vecBlock.InitQuantQuery(query);
++#endif
+ }
+
+ template <typename CubeBlockType, typename VecBlockType>
+ __aicore__ inline void KvQuantSparseFlashAttentionMla<CubeBlockType, VecBlockType>::InitMMResBuf(
+     __gm__ uint8_t *workspace)
+ {
+-    uint32_t mm1RightSize = constInfo.s2BaseSize * 576 * sizeof(Q_T);
++    uint32_t mm1RightSize = QSFA_Q8C4_CANDIDATE ? qsfa_q8c4_layout::KV_BYTES :
++                                               constInfo.s2BaseSize * 576 * sizeof(Q_T);
+     l1BufferManager.Init(pipe, 524288); // 512 * 1024
+     l1RightBuffers.Init(l1BufferManager, mm1RightSize);
+     l1RightBuffers.Get().SetCrossCoreID(crossCoreSyncBufId, INVALID_CROSS_CORE_EVENT_ID);
+--- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_cube_mla_arch35.h
++++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_cube_mla_arch35.h
+@@ -24,6 +24,9 @@
+ #include "lib/matmul_intf.h"
+ #include "lib/matrix/matmul/tiling.h"
+ #include "kv_quant_sparse_flash_attention_common_arch35.h"
++#if QSFA_Q8C4_CANDIDATE
++#include "q8c4_cube.h"
++#endif
+
+ #if __has_include("../../common/op_kernel/offset_calculator.h")
+ #include "../../common/op_kernel/offset_calculator.h"
+@@ -73,9 +76,14 @@
+ TEMPLATES_DEF
+ class QSFAMatmulService {
+ public:
++#if QSFA_Q8C4_CANDIDATE
++    static_assert(!IS_SPLIT_G && !isFd, "MX candidate supports no split-G or split-KV");
++    static_assert(IsSameType<Q_T, bfloat16_t>::value && IsSameType<T, float>::value,
++                  "MX QK keeps BF16 PV/P and FP32 accumulation");
++#endif
+     /* =================编译期常量的基本块信息================= */
+     static constexpr uint32_t s1BaseSize = 64;
+-    static constexpr uint32_t s2BaseSize = 128;
++    static constexpr uint32_t s2BaseSize = QSFA_Q8C4_CANDIDATE ? qsfa_q8c4_layout::N : 128;
+     static constexpr uint32_t dBaseSize = 576;
+     static constexpr uint32_t dBaseMatmulSize = 128;
+
+@@ -170,7 +178,8 @@
+ TEMPLATES_DEF_NO_DEFAULT
+ __aicore__ inline void QSFAMatmulService<TEMPLATE_ARGS>::InitLocalBuffer()
+ {
+-    constexpr uint32_t mm1LeftSize = s1BaseSize * dBaseSize * sizeof(Q_T);
++    constexpr uint32_t mm1LeftSize = QSFA_Q8C4_CANDIDATE ? qsfa_q8c4_layout::Q_BYTES :
++                                                        s1BaseSize * dBaseSize * sizeof(Q_T);
+     l1QBuffers.Init((*qsfaL1BufferManagerPtr), mm1LeftSize);
+
+     // L0A B C 当前写死，能否通过基础api获取
+@@ -245,7 +254,9 @@
+         WaitFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
+     }
+
++#if !QSFA_Q8C4_CANDIDATE
+     inputLeftBuf.Wait<HardEvent::MTE2_MTE1>(); // 等待L1A
++#endif
+     Buffer<BufferType::L0C> mm1ResL0C = mmL0CBuffers.Get();
+     mm1ResL0C.Wait<HardEvent::FIX_M>(); // 占用
+
+@@ -257,9 +268,15 @@
+         1                                          // isRightTranspose
+     };
+
++#if QSFA_Q8C4_CANDIDATE
++    QsfaMxQk(inputLeftBuf.GetTensor<uint8_t>(), inputRightBuf.GetTensor<uint8_t>(),
++             mmL0ABuffers, mmL0BBuffers, mm1ResL0C.GetTensor<float>(),
++             static_cast<uint32_t>(runInfo.mRealSize), static_cast<uint32_t>(runInfo.s2RealSize));
++#else
+     MatmulK<Q_T, Q_T, T, s1BaseSize, s2BaseSize, dBaseMatmulSize, ABLayout::MK, ABLayout::KN>( // m,n不切，k切128
+         inputLeftBuf.GetTensor<Q_T>(), inputRightBuf.GetTensor<Q_T>(), // mm1B直接用tensor的数据
+         mmL0ABuffers, mmL0BBuffers, mm1ResL0C.GetTensor<T>(), param);
++#endif
+
+     if (unlikely(runInfo.s2LoopCount == runInfo.s2LoopLimit)) {
+         inputLeftBuf.Set<HardEvent::MTE1_MTE2>(); // 释放L1A
+@@ -294,6 +311,15 @@
+ {
+     // 左矩阵复用，S2的第一次循环加载左矩阵
+     // 加载左矩阵到L1, 全载
++#if QSFA_Q8C4_CANDIDATE
++    // Q=1 candidate: Vec0 decodes Q's RoPE and publishes the complete MX Q
++    // buffer before signalling flag14. Only AIV0 is the Q producer.
++    inputLeftBuf = l1QBuffers.Get();
++    if (unlikely(runInfo.s2LoopCount == 0)) {
++        inputLeftBuf.Wait<HardEvent::MTE1_MTE2>();
++        CrossCoreWaitFlag<SYNC_MODE, PIPE_MTE1>(qsfa_q8c4_layout::Q_READY_FLAG);
++    }
++#else
+     if (unlikely(runInfo.s2LoopCount == 0)) { // sOuter循环第一个基本块：搬运Q
+         inputLeftBuf = l1QBuffers.Get();
+         inputLeftBuf.Wait<HardEvent::MTE1_MTE2>(); // 占用L1A
+@@ -309,6 +335,7 @@
+         // 左矩阵复用时，sinner循环内不需要MTE2同步等待
+         inputLeftBuf.Set<HardEvent::MTE2_MTE1>(); // 通知
+     }
++#endif
+ }
+
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAMatmulService<TEMPLATE_ARGS>::IterateBmm2QSFA(
+--- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_vector_mla_arch35.h
++++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_vector_mla_arch35.h
+@@ -16,6 +16,9 @@
+ #define KV_QUANT_SPARSE_FLASH_ATTENTION_SERVICE_VECTOR_MLA_ARCH35_H
+
+ #include <limits>
++#if QSFA_Q8C4_CANDIDATE
++#include "lowbit_vector.h"
++#endif
+ #include "adv_api/utils/init_global_memory.h"
+ #include "kv_quant_sparse_flash_attention_common_arch35.h"
+ #include "kernel_operator_list_tensor_intf.h"
+@@ -47,11 +50,11 @@
+     static constexpr uint32_t BUFFER_SIZE_BYTE_32B = 32;
+     /* =================编译期常量的基本块信息================= */
+     static constexpr uint32_t s1BaseSize = 64;
+-    static constexpr uint32_t s2BaseSize = 128;
++    static constexpr uint32_t s2BaseSize = QSFA_Q8C4_CANDIDATE ? 64 : 128;
+     static constexpr uint32_t vec1Srcstride = (s1BaseSize >> 1) + 1;
+     static constexpr uint32_t dVTemplateType = 512;
+     static constexpr uint32_t qsfaDTemplateAlign64 = Align64Func(dVTemplateType);
+-    static constexpr uint32_t dVTemplateTypeInput = 672;
++    static constexpr uint32_t dVTemplateTypeInput = QSFA_Q8C4_CANDIDATE ? 416 : 672;
+     static constexpr float R0 = 1.0f;
+ #if KVQSFA_VERSION >= 2
+     static constexpr uint64_t SYNC_SINKS_BUF_FLAG = 6;
+@@ -78,6 +81,9 @@
+         }
+     }
+
++#if QSFA_Q8C4_CANDIDATE
++    __aicore__ inline void InitQuantQuery(__gm__ uint8_t *query) { quantQuery = query; }
++#endif
+     // 初始化LocalTensor
+     __aicore__ inline void InitLocalBuffer(TPipe *pipe, ConstInfo &constInfo);
+     // 初始化attentionOutGM
+@@ -180,6 +186,10 @@
+ #endif
+     GlobalTensor<uint32_t> kvPhyAddrGm;
+
++#if QSFA_Q8C4_CANDIDATE
++    __gm__ uint8_t *quantQuery = nullptr;
++    TBuf<> mxCacheStage;
++#endif
+     TBuf<> commonTBuf; // common的复用空间
+ #if KVQSFA_VERSION >= 2
+     TBuf<> sinksBuf;
+@@ -450,6 +460,14 @@
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::DequantKv(
+     LocalTensor<Q_T> antiKvTensorAsB16, LocalTensor<KV_T> srcTensor, int64_t dealRow, ConstInfo &constInfo)
+ {
++#if QSFA_Q8C4_CANDIDATE
++    // One block's C4 data feeds BOTH independent QK(MX) and PV(BF16) operands.
++    auto mx = mxCacheStage.template Get<uint8_t>();
++    Simt::VF_CALL<qsfa_official_vector::DecodeCache>(Simt::Dim3(qsfa_official_vector::THREADS),
++        (__ubuf__ uint8_t*)srcTensor.GetPhyAddr(),
++        (__ubuf__ uint16_t*)antiKvTensorAsB16.GetPhyAddr(),
++        (__ubuf__ uint8_t*)mx.GetPhyAddr(), static_cast<uint32_t>(dealRow));
++#else
+     // srcTensor是nope(512) + nope(64) + scale + pad, dstTensor是nope(512) + rope(64)
+     AntiquantVFFp8D448<Q_T, KV_T>(antiKvTensorAsB16, srcTensor, dealRow);
+
+@@ -464,6 +482,7 @@
+              1,  // dst repeat stride
+              21  // src repeat stride, 640 / 32   // 640 -> 672 : 20 -> 21
+          });
++#endif
+ }
+
+ TEMPLATES_DEF_NO_DEFAULT
+@@ -480,6 +499,21 @@
+
+     LocalTensor<Q_T> dst = outputL1.GetTensor<Q_T>();
+     DataCopy(dst[s2StartIdx * blockElementNum], antiKvTensorAsB16, dataCopyParams);
++#if QSFA_Q8C4_CANDIDATE
++    using namespace qsfa_q8c4_layout;
++    auto mx = mxCacheStage.template Get<uint8_t>();
++    auto bytes = outputL1.GetTensor<uint8_t>();
++    // Full 16-row chunks: harness restricts S%128==0, each AIV owns 32 rows.
++    for (uint32_t chunk = 0; chunk < 4; ++chunk) {
++        DataCopy(bytes[K_DATA + chunk * N * K + s2StartIdx * 32], mx[chunk * 16 * K],
++                 {4, 16, 0, N - 16});
++        DataCopy(bytes[K_SCALE + chunk * N * 4 + s2StartIdx * 4], mx[8192 + chunk * 64], 64);
++    }
++    // mxCacheStage is a single buffer: wait before next DecodeCache overwrites it.
++    auto event = tPipe->template FetchEventID<HardEvent::MTE3_V>();
++    SetFlag<HardEvent::MTE3_V>(event);
++    WaitFlag<HardEvent::MTE3_V>(event);
++#endif
+ }
+
+ TEMPLATES_DEF_NO_DEFAULT
+@@ -542,6 +576,23 @@
+     blockSize = constInfo.blockSize;
+     maxBlockNumPerBatch = constInfo.maxBlockNumPerBatch;
+
++#if QSFA_Q8C4_CANDIDATE
++    if (runInfo.s2LoopCount == 0 && constInfo.subBlockIdx == 0) {
++        using namespace qsfa_q8c4_layout;
++        auto staged = stage2OutBuf.template Get<uint8_t>();
++        Simt::VF_CALL<qsfa_official_vector::PrepareQuery>(Simt::Dim3(qsfa_official_vector::THREADS),
++            quantQuery, (__ubuf__ uint8_t*)staged.GetPhyAddr(), static_cast<uint32_t>(constInfo.gSize));
++        auto event = tPipe->template FetchEventID<HardEvent::V_MTE3>();
++        SetFlag<HardEvent::V_MTE3>(event);
++        WaitFlag<HardEvent::V_MTE3>(event);
++        LocalTensor<uint8_t> queryL1(TPosition::A1, Q_BASE, Q_BYTES);
++        DataCopy(queryL1, staged, Q_BYTES);
++        CrossCoreSetFlag<4, PIPE_MTE3>(Q_READY_FLAG);
++        auto done = tPipe->template FetchEventID<HardEvent::MTE3_V>();
++        SetFlag<HardEvent::MTE3_V>(done);
++        WaitFlag<HardEvent::MTE3_V>(done);
++    }
++#endif
+     CalSparseCalSize(runInfo, constInfo);
+     ProcessSparseKv(outputL1, v0ResGm, runInfo, constInfo);
+
+@@ -777,6 +828,20 @@
+                                                                          LocalTensor<VEC2_RES_T> &vec2ResUb,
+                                                                          int64_t vec2S1Idx, int64_t qsfaVec2CalcSize)
+ {
++#if QSFA_Q8C4_CANDIDATE
++    // Final normalized FP32 output goes straight to D32 E4M3/E8M0.
++    // This final tile has no future Vec0 using this now-free queue buffer.
++    auto packed = stage0OutQue.template AllocTensor<uint8_t>();
++    Simt::VF_CALL<qsfa_official_vector::EncodeOutput>(Simt::Dim3(qsfa_official_vector::THREADS),
++        (__ubuf__ float*)vec2ResUb.GetPhyAddr(), (__ubuf__ uint8_t*)packed.GetPhyAddr(),
++        static_cast<uint32_t>(runInfo.vec2MRealSize));
++    stage0OutQue.EnQue(packed);
++    packed = stage0OutQue.template DeQue<uint8_t>();
++    auto out = attentionOutGm.template ReinterpretCast<uint8_t>();
++    DataCopy(out[(runInfo.attentionOutOffset / 512) * qsfa_official_vector::OUTPUT_ROW_BYTES],
++             packed, runInfo.vec2MRealSize * qsfa_official_vector::OUTPUT_ROW_BYTES);
++    stage0OutQue.FreeTensor(packed);
++#else
+     LocalTensor<OUTPUT_T> attenOut;
+     int64_t dSizeAligned64 = (int64_t)qsfaDTemplateAlign64;
+
+@@ -792,6 +857,7 @@
+     dataCopyParams.blockCount = runInfo.vec2MRealSize;
+
+     DataCopyPad(this->attentionOutGm[runInfo.attentionOutOffset], attenOut, dataCopyParams);
++#endif
+ }
+
+ TEMPLATES_DEF_NO_DEFAULT
+@@ -990,7 +1056,16 @@
+
+     tPipe->InitBuffer(stage1OutQue[0], 1, vec1Srcstride * s2BaseSize * sizeof(Q_T));
+     tPipe->InitBuffer(stage1OutQue[1], 1, vec1Srcstride * s2BaseSize * sizeof(Q_T));
++#if QSFA_Q8C4_CANDIDATE
++    // H<=32: 41984B holds initial Q operands and later <=16x512 FP32 output.
++    // Smaller live UB leaves room for both SIMT data cache and SDK scratch.
++    tPipe->InitBuffer(stage2OutBuf, qsfa_q8c4_layout::Q_BYTES);
++#else
+     tPipe->InitBuffer(stage2OutBuf, (s1BaseSize / CV_RATIO) * qsfaDTemplateAlign64 * sizeof(T));
++#endif
++#if QSFA_Q8C4_CANDIDATE
++    tPipe->InitBuffer(mxCacheStage, qsfa_official_vector::MX_STAGE_BYTES);
++#endif
+
+     mte3ToVId[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
+     mte3ToVId[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
+@@ -1510,6 +1585,9 @@
+ TEMPLATES_DEF class QSFAVectorServiceDummy {
+ public:
+     __aicore__ inline QSFAVectorServiceDummy(){};
++#if QSFA_Q8C4_CANDIDATE
++    __aicore__ inline void InitQuantQuery(__gm__ uint8_t *query) {}
++#endif
+ #if KVQSFA_VERSION >= 2
+     __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax,
+                                        __gm__ uint8_t *softmaxSum, ConstInfo &constInfo)

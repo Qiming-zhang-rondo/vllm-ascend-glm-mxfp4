@@ -20,6 +20,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+option(QSFA_BUILD_OFFICIAL "Build pinned official fused QSFA experiments" OFF)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(COMMAND "${Python3_EXECUTABLE}" -c
@@ -62,6 +63,14 @@ endforeach()
 list(REMOVE_DUPLICATES QSFA_CANN_INCLUDES)
 separate_arguments(TORCH_ABI_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 
+if(QSFA_BUILD_OFFICIAL)
+    list(PREPEND QSFA_CANN_INCLUDES
+        "${CMAKE_CURRENT_SOURCE_DIR}/official"
+        "${CMAKE_CURRENT_SOURCE_DIR}/official/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/official/vendor/attention/kv_quant_sparse_flash_attention/op_kernel"
+        "${CMAKE_CURRENT_SOURCE_DIR}/official/vendor/common/include/op_kernel")
+endif()
+
 if(QSFA_BISHENG)
     include(cmake/direct_bisheng.cmake)
     qsfa_direct_objects(QSFA_KERNEL_OBJECTS)
@@ -70,6 +79,12 @@ if(QSFA_BISHENG)
     target_link_options(qsfa_q8c4_o8 PRIVATE --npu-arch=dav-3510)
 else()
     add_library(qsfa_q8c4_o8 SHARED csrc/torch_binding.cpp csrc/vector.asc csrc/matmul.asc csrc/tiled.asc)
+endif()
+if(QSFA_BUILD_OFFICIAL)
+    target_sources(qsfa_q8c4_o8 PRIVATE csrc/official_binding.cpp)
+    if(NOT QSFA_BISHENG)
+        target_sources(qsfa_q8c4_o8 PRIVATE official/baseline.asc official/candidate.asc)
+    endif()
 endif()
 target_include_directories(qsfa_q8c4_o8 PRIVATE
     csrc ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_ROOT}/include" ${QSFA_CANN_INCLUDES})

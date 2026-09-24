@@ -29,14 +29,25 @@ function(qsfa_direct_objects output)
     endif()
     set(objects)
     file(GLOB kernel_headers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.h")
-    foreach(name vector matmul tiled)
+    set(kernel_names vector matmul tiled)
+    if(QSFA_BUILD_OFFICIAL)
+        list(APPEND kernel_names official_baseline official_candidate)
+        file(GLOB_RECURSE official_headers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/official/*.h")
+        list(APPEND kernel_headers ${official_headers})
+    endif()
+    foreach(name IN LISTS kernel_names)
+        if(name MATCHES "^official_(.*)$")
+            set(kernel_source "official/${CMAKE_MATCH_1}.asc")
+        else()
+            set(kernel_source "csrc/${name}.asc")
+        endif()
         set(obj "${CMAKE_CURRENT_BINARY_DIR}/${name}.asc.o")
         # Each translation unit contains all its device callees; -c embeds the
         # complete kernel and host launch stub, no cross-file device calls.
         add_custom_command(OUTPUT "${obj}"
-            COMMAND "${QSFA_BISHENG}" -c "${CMAKE_CURRENT_SOURCE_DIR}/csrc/${name}.asc"
+            COMMAND "${QSFA_BISHENG}" -c "${CMAKE_CURRENT_SOURCE_DIR}/${kernel_source}"
                 -o "${obj}" ${flags} "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc"
-            DEPENDS "csrc/${name}.asc" ${kernel_headers}
+            DEPENDS "${kernel_source}" ${kernel_headers}
             COMMENT "Compiling ${name}.asc with installed native bisheng"
             VERBATIM COMMAND_EXPAND_LISTS)
         set_source_files_properties("${obj}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)

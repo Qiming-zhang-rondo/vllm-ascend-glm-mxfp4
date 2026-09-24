@@ -44,12 +44,12 @@ ARGUMENT_ORDER = ("q", "qs", "kv", "ks", "rope", "idx")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=("candidate", "native"), default="candidate")
+    parser.add_argument("--variant", choices=("candidate", "native", "source_control"), default="candidate")
     parser.add_argument(
         "--implementation",
-        choices=("tiled", "prototype"),
+        choices=("tiled", "prototype", "official"),
         default="tiled",
-        help="Candidate path: tiled (3 launches, on-chip K/V) or original prototype (5 launches)",
+        help="Candidate path: tiled (3 launches), prototype (5), or official source pipeline (1 fused launch)",
     )
     parser.add_argument("--library", type=Path, required=True, help="Built custom torch operator shared library")
     parser.add_argument("--output", type=Path, default=Path("qsfa_q8c4_o8_results.json"))
@@ -74,6 +74,10 @@ def parse_args(argv=None):
         parser.error("Require S in [128,8192], S divisible by 128, and K >= S")
     if args.device < 0 or args.warmup < 1 or args.iters < 1 or args.threads < 1:
         parser.error("device must be nonnegative; warmup, iters and threads must be positive")
+    if args.variant == "source_control" and args.implementation != "official":
+        parser.error("source_control requires --implementation official")
+    if args.implementation == "official" and not args.input and args.heads == 64:
+        parser.error("The initial official-pipeline adaptation supports only H in {8,16,32}")
     return args
 
 
@@ -109,6 +113,10 @@ def candidate_operation(implementation):
         return torch.ops.qsfa_q8c4_o8.forward_tiled
     if implementation == "prototype":
         return torch.ops.qsfa_q8c4_o8.forward
+    if implementation == "official":
+        return torch.ops.qsfa_q8c4_o8.forward_official
+    if implementation == "official_fp8":
+        return torch.ops.qsfa_q8c4_o8.forward_official_fp8
     raise ValueError(f"Unknown candidate implementation: {implementation}")
 
 
@@ -141,14 +149,20 @@ def load_runtime(library, device_index, *, native=False, implementation="tiled")
             "library": None if native else str(library.resolve()),
             "api": "torch_npu.npu_kv_quant_sparse_flash_attention"
             if native
-            else f"torch.ops.qsfa_q8c4_o8.{'forward_tiled' if implementation == 'tiled' else 'forward'}",
+            else "torch.ops.qsfa_q8c4_o8."
+            + {
+                "tiled": "forward_tiled",
+                "prototype": "forward",
+                "official": "forward_official",
+                "official_fp8": "forward_official_fp8",
+            }[implementation],
         },
     )
 
 
 def check_status(result):
     if not isinstance(result, (tuple, list)) or len(result) != 3:
-        raise AssertionError("Expected (uint8 output, uint8 output_scales, int32 status)")
+        raise AssertionError("Expected (output, output_scales, int32 status)")
     status = result[2]
     if not isinstance(status, torch.Tensor) or status.dtype != torch.int32 or tuple(status.shape) != (1,):
         raise AssertionError("Expected status tensor int32[1]")
@@ -249,21 +263,23 @@ def capture_profile(invoke, synchronize, output_path, *, validate_result=check_s
 
 @torch.inference_mode()
 def run(args):
-    if args.variant == "native":
+    if args.variant in ("native", "source_control"):
         return run_native(args)
+    official = args.implementation == "official"
     report = {
         "status": "running",
         "stage": "initialization",
-        "scope": "Actual custom A5 Q8/C4/O8 prototype; one Q token; native baseline runs in a separate process",
+        "scope": "Custom A5 Q8/C4/O8 candidate; one Q token; native baseline runs in a separate process",
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "compute_verified": False,
         "performance": {"measured": False},
         "implementation": {
             "name": args.implementation,
-            "launches_per_call": 3 if args.implementation == "tiled" else 5,
+            "launches_per_call": {"official": 1, "tiled": 3, "prototype": 5}[args.implementation],
             "expanded_kv_in_gm": args.implementation == "prototype",
-            "scores_and_probabilities_in_gm": True,
-            "fully_fused_attention": False,
+            "scores_and_probabilities_in_gm": not official,
+            "fully_fused_attention": official,
+            "online_softmax": official,
         },
         "contract": {
             "input": "Sources rounded to BF16; Q=1; sparse indices supplied, not computed by this test",
@@ -288,7 +304,24 @@ def run(args):
         torch.set_num_threads(args.threads)
         stage(args, report, "CPU inputs, low-bit packing and payload validation")
         query, kv, indices, scale = load_inputs(args)
-        prepared, decoded_query, decoded_kv, original_query, original_kv = prepare_inputs(query, kv, indices, scale)
+        argument_order = ARGUMENT_ORDER
+        if official:
+            from benchmarks.qsfa_q8c4_o8.official_inputs import ARGUMENT_ORDER as OFFICIAL_ARGUMENT_ORDER
+            from benchmarks.qsfa_q8c4_o8.official_inputs import prepare_inputs as prepare_official_inputs
+
+            prepared, decoded_query, decoded_kv, original_query, original_kv, official_contract = (
+                prepare_official_inputs(query, kv, indices, scale)
+            )
+            argument_order = OFFICIAL_ARGUMENT_ORDER
+            report["contract"]["official_pipeline"] = official_contract
+            report["contract"]["pv"] = (
+                "Online FP32 softmax, BF16 P and decoded C4 V; FP32 PV accumulation and rescaling"
+            )
+            report["contract"]["reference_note"] = (
+                "Official logical full-softmax golden; online blockwise BF16 rounding may differ; gates unchanged"
+            )
+        else:
+            prepared, decoded_query, decoded_kv, original_query, original_kv = prepare_inputs(query, kv, indices, scale)
         heads = original_query.shape[1]
         report["case"] = {
             "query_shape": list(original_query.shape),
@@ -310,8 +343,13 @@ def run(args):
         )
         report["runtime"] = runtime_info
         stage(args, report, "Copy validated packed inputs to NPU")
-        device_inputs = [prepared[name].to(device) for name in ARGUMENT_ORDER]
+        device_inputs = [prepared[name].to(device) for name in argument_order]
         synchronize()
+        if official:
+            for name, value in zip(argument_order, device_inputs):
+                if not torch.equal(value.detach().cpu(), prepared[name]):
+                    raise AssertionError(f"Official pipeline input {name} changed during H2D; compute was not called")
+            report["input_bytes_verified"] = True
 
         def invoke():
             return operation(*device_inputs, scale)
@@ -348,14 +386,19 @@ def run(args):
 
 @torch.inference_mode()
 def run_native(args):
-    """Measure the installed public QSFA using its actual FP8 PA cache contract."""
+    """Measure installed QSFA or the unchanged FP8 official-source control."""
     from benchmarks.qsfa_q8c4_o8.native_baseline import prepare_inputs as prepare_native_inputs
     from benchmarks.qsfa_q8c4_o8.native_baseline import reference_output
 
+    source_control = args.variant == "source_control"
     report = {
         "status": "running",
         "stage": "initialization",
-        "scope": "Installed native QSFA: BF16 query/output, FP8 E4M3 cache with D128 FP32 scales",
+        "scope": (
+            "Same-source official QSFA control: BF16 query/output, FP8 E4M3 cache with D128 FP32 scales"
+            if source_control
+            else "Installed native QSFA: BF16 query/output, FP8 E4M3 cache with D128 FP32 scales"
+        ),
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "compute_verified": False,
         "performance": {"measured": False},
@@ -365,9 +408,27 @@ def run_native(args):
         torch.set_num_threads(args.threads)
         stage(args, report, "Native baseline: CPU FP8 combined-PA inputs and decoded-payload golden")
         query, kv, indices, scale = load_inputs(args)
+        if args.implementation == "official":
+            from benchmarks.qsfa_q8c4_o8.official_inputs import validate_head_count
+
+            validate_head_count(query)
         inputs, decoded_kv, contract = prepare_native_inputs(query, kv, indices, scale)
         query, kv = query.bfloat16(), kv.bfloat16()
         report["contract"] = contract
+        if source_control:
+            from benchmarks.qsfa_q8c4_o8.official_inputs import OFFICIAL_SOURCE_REF
+
+            contract.update(
+                {
+                    "api": "torch.ops.qsfa_q8c4_o8.forward_official_fp8",
+                    "source_repo": "https://gitcode.com/cann/ops-transformer",
+                    "source_ref": OFFICIAL_SOURCE_REF,
+                    "specialization": {"aic_cores": 1, "flash_decode": False, "s2_tile": 128},
+                    "installed_native_tiling_equivalence_claimed": False,
+                    "purpose": "Validate official pipeline port before candidate; same native accuracy gates",
+                    "cache_carrier_dtype": "uint8",
+                }
+            )
         report["case"] = {
             "query_shape": list(query.shape),
             "kv_shape": list(kv.shape),
@@ -381,8 +442,15 @@ def run_native(args):
         }
         expected = reference_output(query, decoded_kv, indices, scale)
         original_golden = attention_reference(query, kv, indices, scale).bfloat16().float()
-        stage(args, report, "Native baseline: load existing torch_npu QSFA API")
-        operation, device, synchronize, runtime_info = load_runtime(args.library, args.device, native=True)
+        stage(
+            args, report, "Load official-source FP8 control" if source_control else "Load existing torch_npu QSFA API"
+        )
+        if source_control:
+            operation, device, synchronize, runtime_info = load_runtime(
+                args.library, args.device, implementation="official_fp8"
+            )
+        else:
+            operation, device, synchronize, runtime_info = load_runtime(args.library, args.device, native=True)
         report["runtime"] = runtime_info
         stage(args, report, "Native baseline: copy prepared inputs to NPU")
         # MLA absorb uses key=value. Preserve the alias, including on device.
@@ -400,11 +468,28 @@ def run_native(args):
         if not torch.equal(device_inputs["key"].view(torch.uint8).cpu(), cache_bytes):
             raise AssertionError("Native PA656 cache changed during H2D transfer; QSFA was not called")
         report["cache_bytes_verified"] = True
+        control_cache = device_inputs["key"].view(torch.uint8) if source_control else None
 
         def invoke():
+            if source_control:
+                return operation(
+                    device_inputs["query"],
+                    control_cache,
+                    device_inputs["sparse_indices"],
+                    device_inputs["block_table"],
+                    device_inputs["actual_seq_lengths_query"],
+                    device_inputs["actual_seq_lengths_kv"],
+                    scale,
+                )
             return operation(**device_inputs)
 
         def validate_contract(output):
+            if source_control:
+                check_status(output)
+                empty_scale = output[1]
+                if not isinstance(empty_scale, torch.Tensor) or empty_scale.dtype != torch.uint8 or empty_scale.numel():
+                    raise AssertionError("Official FP8 control must return an empty uint8 output-scale tensor")
+                output = output[0]
             if not isinstance(output, torch.Tensor):
                 raise TypeError("Public torch_npu QSFA must return one Tensor; no tuple/wrapper fallback is used")
             if output.dtype != torch.bfloat16 or tuple(output.shape) != tuple(expected.shape):
@@ -417,7 +502,7 @@ def run_native(args):
         synchronize()
         stage(args, report, "Native baseline: decoded-cache correctness check")
         validate_contract(result)
-        actual = result.detach().cpu()
+        actual = (result[0] if source_control else result).detach().cpu()
         report["accuracy"] = compare_output(actual.float(), expected, original_golden)
         report["accuracy"]["native_elementwise_check"] = validate_native_output(actual, expected)
         if not report["accuracy"]["operator_correctness_passed"]:
