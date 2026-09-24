@@ -85,7 +85,8 @@ up to512, plus `12 * selected` bytes and8KiB scratch must fit the chosen
 dynamic UB reservation. Oversized shapes are rejected before a device launch.
 
 Local validation on 2026-09-24: host codec, layout, Cube-call contract, libtorch
-Meta/binding and launcher tests pass; CANN compilation and A5 execution pending.
+Meta/binding and launcher tests pass. A5 results for the first compiled version
+and the subsequent, not-yet-device-verified optimization are recorded below.
 Ruff and Bash syntax checks pass. Repository `format.sh ci` cannot run because
 pre-commit is absent locally; no dependencies were installed for this check.
 
@@ -115,4 +116,50 @@ ND-only check (`got format 0`). The shared raw-storage check now permits
 contiguous, zero-offset NCHW(0) as well as ND(2), including internally allocated
 BF16 output; both are linear base formats. Capacity is checked and opaque
 NZ/FRACTAL formats remain rejected. No format conversion is added to timing.
-Device compute correctness and performance are still pending.
+The subsequent `f459142c4` A5 run reached compute and timing as recorded below.
+
+## A5 evidence and next optimization
+
+User-supplied profiling for `f459142c4`, Q `[1,8,576]`, KV `[8192,576]`,
+selected 2048, reports the following device tasks. These are single captured
+invocations, not the 20-sample synchronized wall-time medians.
+
+| Path | Attention task duration | Block Num |
+| --- | ---: | ---: |
+| Q8/C4/O8 candidate | 933.904 us | 1 |
+| Same-source FP8 control | 41.464 us | 1 |
+| Installed native QSFA | 69.825 us | 32 |
+
+Candidate task latency is 22.52 times the same-source control and 13.37 times
+the installed native task. The two custom paths additionally execute a
+ZerosLike task (1.290 us candidate, 1.127 us control). The listed wait time is
+not part of the task duration and is not added to this table. Different native
+tiling remains visible; task timing alone does not identify which internal
+Cube/Vector stage dominates. This result establishes device-side regression,
+not a Python-only overhead problem.
+
+The candidate passed decoded-payload correctness (relative RMSE 0.007328),
+but failed the existing original-BF16 quantization screen (relative RMSE
+0.115499 > 0.10). Incremental relative RMSE against the C4/BF16 reference was
+0.042892. These are synthetic operator output errors, not model accuracy.
+
+The next revision removes three unnecessary costs without changing cache,
+scale, query, output or accuracy-gate contracts:
+
+1. `lowbit_vector.h::DecodeCache` processes packed pairs and builds BF16 V
+   bits directly from E2M1/E8M0. It avoids FP8-to-FP32 software decode and
+   multiplication, halves duplicate input loads and uses aligned B32/B16
+   stores. Host tests enumerate every packed byte and every E8M0 code,
+   including signed zero, subnormal, overflow and NaN cases.
+2. `CopyOutKvUb2L1` coalesces nine transfers into three with identical bytes
+   and the same single-buffer completion fence. No synchronization is removed.
+3. `IterateBmm2QSFA` keeps PV's output tile N=128 independently of S2=64.
+   This reduces candidate PV MMADs from eight to four per S2 tile. Reduction
+   K, FP32 accumulation, P/V layouts, and existing L0 capacities remain the same.
+
+QK still uses MXFP8 operands with FP32 accumulation; PV still uses BF16.
+The candidate still has SIMT producers, repeated per-chunk synchronization,
+and S2=64. This is a bounded optimization of the passing path, not a claim
+that the measured regression is resolved. Its A5 compile, correctness and
+task duration need a new run using the same `--implementation official --profile`
+command. No dependencies or toolkit are installed by that command.

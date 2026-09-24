@@ -155,6 +155,19 @@
  }
 
  TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAMatmulService<TEMPLATE_ARGS>::IterateBmm2QSFA(
+@@ -325,7 +352,11 @@
+                          static_cast<uint32_t>(runInfo.s2RealSize),  // singleK 128
+                          0, 0};
+
+-    MatmulN<Q_T, Q_T, T, s1BaseSize, s2BaseSize, dBaseMatmulSize, ABLayout::MK, ABLayout::KN>(
++    // PV's output N is the 512-wide latent dimension, independent of the
++    // selected-token S2 tile (its reduction K). Keep the official N128 tile
++    // when candidate S2 is 64: 4 rather than 8 MMADs, same K and L1 layout.
++    constexpr uint32_t pvBaseN = 128;
++    MatmulN<Q_T, Q_T, T, s1BaseSize, pvBaseN, dBaseMatmulSize, ABLayout::MK, ABLayout::KN>(
+         inputRightBuf.GetTensor<Q_T>(s2BaseSize * constInfo.dSizeNope), // 左矩阵P 来自rope位置
+         inputRightBuf.GetTensor<Q_T>(),                                 // 右矩阵V nope
+         mmL0ABuffers, mmL0BBuffers, mm2ResL0C.GetTensor<T>(), qsfaParam);
 --- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_vector_mla_arch35.h
 +++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_vector_mla_arch35.h
 @@ -16,6 +16,9 @@
@@ -234,11 +247,11 @@
 +    auto mx = mxCacheStage.template Get<uint8_t>();
 +    auto bytes = outputL1.GetTensor<uint8_t>();
 +    // Full 16-row chunks: harness restricts S%128==0, each AIV owns 32 rows.
-+    for (uint32_t chunk = 0; chunk < 4; ++chunk) {
-+        DataCopy(bytes[K_DATA + chunk * N * K + s2StartIdx * 32], mx[chunk * 16 * K],
-+                 {4, 16, 0, N - 16});
-+        DataCopy(bytes[K_SCALE + chunk * N * 4 + s2StartIdx * 4], mx[8192 + chunk * 64], 64);
-+    }
++    // The four K128 chunks are adjacent NZ column blocks. Coalesce their
++    // payload copies, and likewise the four E8M0 chunks. DataCopy lengths and
++    // gaps below are 32-byte blocks; bytes/layout/lifetime stay unchanged.
++    DataCopy(bytes[K_DATA + s2StartIdx * 32], mx, {16, 16, 0, N - 16});
++    DataCopy(bytes[K_SCALE + s2StartIdx * 4], mx[8192], {4, 2, 0, (N * 4 - 64) / 32});
 +    // mxCacheStage is a single buffer: wait before next DecodeCache overwrites it.
 +    auto event = tPipe->template FetchEventID<HardEvent::MTE3_V>();
 +    SetFlag<HardEvent::MTE3_V>(event);

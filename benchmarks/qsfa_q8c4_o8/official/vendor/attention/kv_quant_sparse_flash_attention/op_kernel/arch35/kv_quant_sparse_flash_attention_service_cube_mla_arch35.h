@@ -352,7 +352,11 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAMatmulService<TEMPLATE_ARGS>
                          static_cast<uint32_t>(runInfo.s2RealSize),  // singleK 128
                          0, 0};
 
-    MatmulN<Q_T, Q_T, T, s1BaseSize, s2BaseSize, dBaseMatmulSize, ABLayout::MK, ABLayout::KN>(
+    // PV's output N is the 512-wide latent dimension, independent of the
+    // selected-token S2 tile (its reduction K). Keep the official N128 tile
+    // when candidate S2 is 64: 4 rather than 8 MMADs, same K and L1 layout.
+    constexpr uint32_t pvBaseN = 128;
+    MatmulN<Q_T, Q_T, T, s1BaseSize, pvBaseN, dBaseMatmulSize, ABLayout::MK, ABLayout::KN>(
         inputRightBuf.GetTensor<Q_T>(s2BaseSize * constInfo.dSizeNope), // 左矩阵P 来自rope位置
         inputRightBuf.GetTensor<Q_T>(),                                 // 右矩阵V nope
         mmL0ABuffers, mmL0BBuffers, mm2ResL0C.GetTensor<T>(), qsfaParam);

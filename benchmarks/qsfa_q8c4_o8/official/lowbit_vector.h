@@ -24,19 +24,50 @@ __simt_callee__ inline uint32_t MxScale(uint32_t row, uint32_t group)
     return ((row / 16) * 32 + (group / 2) * 16 + row % 16) * 2 + group % 2;
 }
 
+// E2M1 times an E8M0 power of two has at most two significant bits. Construct
+// BF16 directly instead of decoding via FP8 -> FP32 multiply -> BF16 round.
+// The two possible subnormal shifts lose no bits. Preserve signed zero,
+// E8M0 exponent zero (2^-127), overflow to infinity, and the NaN scale code.
+__simt_callee__ inline uint16_t Fp4ScaledBf16(uint8_t nibble, uint8_t scale)
+{
+    const uint32_t magnitude = nibble & 7U;
+    const uint32_t sign = uint32_t(nibble & 8U) << 12;
+    if (scale == 255) return 0x7fc0U;
+    if (magnitude == 0) return sign;
+    const int exponent = int(scale) + int(magnitude >> 1) - 1;
+    const uint32_t fraction = magnitude > 1 ? (magnitude & 1U) << 6 : 0U;
+    if (exponent <= 0) return sign | ((128U + fraction) >> (1 - exponent));
+    if (exponent >= 255) return sign | 0x7f80U;
+    return sign | (uint32_t(exponent) << 7) | fraction;
+}
+
+__simt_callee__ inline uint8_t Fp4ExpandedFp8(uint8_t nibble)
+{
+    const uint32_t magnitude = nibble & 7U;
+    const uint32_t code = magnitude == 0 ? 0 : (magnitude == 1 ? 0x30 : (magnitude + 12) << 2);
+    return code | ((nibble & 8U) << 4);
+}
+
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void DecodeCache(
     __ubuf__ uint8_t* cache, __ubuf__ uint16_t* values,
     __ubuf__ uint8_t* mx, uint32_t rows)
 {
-    using namespace qsfa_codec;
-    for (uint32_t i = threadIdx.x; i < rows * 512; i += THREADS) {
-        const uint32_t row = i / 512, d = i % 512;
+    // One thread owns a packed byte (two adjacent values). The NZ pair offsets
+    // are naturally aligned: write one B32 V pair and one B16 K pair, avoiding
+    // adjacent threads' subword writes and duplicate payload/scale loads.
+    auto valuePairs = (__ubuf__ uint32_t*)values;
+    auto mxPairs = (__ubuf__ uint16_t*)mx;
+    for (uint32_t i = threadIdx.x; i < rows * 256; i += THREADS) {
+        const uint32_t row = i / 256, d = (i % 256) * 2;
         const auto base = cache + row * qsfa_q8c4_layout::CACHE_ROW_BYTES;
-        const uint8_t fp8 = ExpandFp4((base[d / 2] >> ((d & 1) * 4)) & 15);
+        const uint8_t packed = base[d / 2], scale = base[384 + d / 32];
+        const uint8_t lo = packed & 15U, hi = packed >> 4;
         // Existing PV producer is 17-row bank-padded BF16 NZ in UB.
-        values[Nz(row, d, 17, 16)] = Bf16(DecodeFp8(fp8) * Scale(base[384 + d / 32]));
+        valuePairs[Nz(row, d, 17, 16) / 2] =
+            uint32_t(Fp4ScaledBf16(lo, scale)) | (uint32_t(Fp4ScaledBf16(hi, scale)) << 16);
         // QK's independent operand retains E8M0 and losslessly expands E2M1.
-        mx[(d / 128) * 16 * 128 + Nz(row, d % 128, 16, 32)] = fp8;
+        mxPairs[((d / 128) * 16 * 128 + Nz(row, d % 128, 16, 32)) / 2] =
+            uint16_t(Fp4ExpandedFp8(lo)) | (uint16_t(Fp4ExpandedFp8(hi)) << 8);
     }
     for (uint32_t i = threadIdx.x; i < rows * 16; i += THREADS) {
         const uint32_t row = i / 16, g = i % 16;

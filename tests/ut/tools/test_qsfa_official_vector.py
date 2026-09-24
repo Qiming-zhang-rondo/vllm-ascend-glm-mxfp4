@@ -132,6 +132,37 @@ def test_cache_decodes_bf16_and_independent_mx_views(actual_vfs, rows):
     check_guard(mx_guard)
 
 
+def test_cache_all_packed_bytes_and_e8m0_codes_against_float_reference(actual_vfs):
+    # Covers both nibble positions, signed zeros, every finite E8M0 exponent,
+    # BF16 subnormals, FP32/BF16 overflow and the reserved NaN scale code.
+    # The oracle uses numerical dequantization, not the optimized bit formula.
+    fp4 = torch.tensor([0.0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+    payload = torch.arange(256).to(torch.uint8).repeat(16, 1)
+    codes = torch.stack((payload & 15, payload >> 4), dim=-1).reshape(16, 512).long()
+    for first_scale in range(0, 256, 16):
+        cache, rope = random_cache(16)
+        cache[:, :256] = payload
+        exponent = torch.arange(first_scale, first_scale + 16)
+        cache[:, 384:400] = exponent[:, None].to(torch.uint8)
+        value_guard, values = guarded(576 * 17 * 2)
+        mx_guard, mx = guarded(8448)
+        actual_vfs.cache(cache.data_ptr(), values.data_ptr(), mx.data_ptr(), 16)
+        scales = torch.exp2(exponent.float() - 127)
+        scales[exponent == 255] = float("nan")
+        expected = (fp4[codes] * scales[:, None]).to(torch.bfloat16)
+        result = nz_inverse(values[: 512 * 17 * 2].view(torch.bfloat16), 17, 512, 16)[:16]
+        assert torch.equal(torch.isnan(result), torch.isnan(expected))
+        valid = ~torch.isnan(expected)
+        # Compare actual bits as well as values: signed zero must survive.
+        assert torch.equal(result.view(torch.int16)[valid], expected.view(torch.int16)[valid])
+        decoded_fp8 = nz_inverse(mx[:8192], 16, 512, 32)
+        assert torch.equal(decoded_fp8, fp4[codes].to(torch.float8_e4m3fn).view(torch.uint8))
+        assert torch.equal(scale_inverse(mx[8192:], 16), cache[:, 384:400])
+        assert torch.equal(nz_inverse(values[512 * 17 * 2 :].view(torch.bfloat16), 17, 64, 16)[:16], rope)
+        check_guard(value_guard)
+        check_guard(mx_guard)
+
+
 def test_16row_producer_copies_reconstruct_full_l1_slot(actual_vfs):
     cache, rope = random_cache(64, seed=77)
     l1_guard, l1 = guarded(107520)

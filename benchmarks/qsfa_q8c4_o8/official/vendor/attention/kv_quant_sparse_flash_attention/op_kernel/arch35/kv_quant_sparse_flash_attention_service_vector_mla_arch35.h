@@ -504,11 +504,11 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CopyOutKvUb2L1(
     auto mx = mxCacheStage.template Get<uint8_t>();
     auto bytes = outputL1.GetTensor<uint8_t>();
     // Full 16-row chunks: harness restricts S%128==0, each AIV owns 32 rows.
-    for (uint32_t chunk = 0; chunk < 4; ++chunk) {
-        DataCopy(bytes[K_DATA + chunk * N * K + s2StartIdx * 32], mx[chunk * 16 * K],
-                 {4, 16, 0, N - 16});
-        DataCopy(bytes[K_SCALE + chunk * N * 4 + s2StartIdx * 4], mx[8192 + chunk * 64], 64);
-    }
+    // The four K128 chunks are adjacent NZ column blocks. Coalesce their
+    // payload copies, and likewise the four E8M0 chunks. DataCopy lengths and
+    // gaps below are 32-byte blocks; bytes/layout/lifetime stay unchanged.
+    DataCopy(bytes[K_DATA + s2StartIdx * 32], mx, {16, 16, 0, N - 16});
+    DataCopy(bytes[K_SCALE + s2StartIdx * 4], mx[8192], {4, 2, 0, (N * 4 - 64) / 32});
     // mxCacheStage is a single buffer: wait before next DecodeCache overwrites it.
     auto event = tPipe->template FetchEventID<HardEvent::MTE3_V>();
     SetFlag<HardEvent::MTE3_V>(event);
