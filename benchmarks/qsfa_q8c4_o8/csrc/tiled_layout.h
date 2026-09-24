@@ -52,8 +52,14 @@ constexpr uint32_t PV_L1_BYTES = PV_V + N * K * 2;
 constexpr uint32_t PV_DECODE_UB_BYTES = N * HALF_K * 2;
 constexpr uint32_t PV_OUT_UB = PV_DECODE_UB_BYTES;
 constexpr uint32_t PV_UB_BYTES = PV_OUT_UB + (M / 2) * N * 4;
+// LocalTensor's fixed offsets describe addresses; they do NOT reserve UB for
+// a SIMD/SIMT kernel. Both native launches must request this dynamic region.
+// 32 KiB covers both stages, leaving space for the 8 KiB runtime reserve and
+// at least 32 KiB SIMT DCache (the hybrid limit is 216 KiB, not 248 KiB).
+constexpr uint32_t DYNAMIC_UB_BYTES = 32 * 1024;
 static_assert(QK_L1_BYTES <= 512 * 1024 && PV_L1_BYTES <= 512 * 1024);
-static_assert(QK_UB_BYTES <= 248 * 1024 && PV_UB_BYTES <= 248 * 1024);
+static_assert(QK_UB_BYTES <= DYNAMIC_UB_BYTES && PV_UB_BYTES <= DYNAMIC_UB_BYTES);
+static_assert(DYNAMIC_UB_BYTES <= (256 - 8 - 32) * 1024);
 static_assert((Q_DATA | K_DATA | Q_SCALE | K_SCALE | Q_ROPE | K_ROPE |
                UQ | UK | UQS | UKS | UQR | UKR | PV_P | PV_V | PV_OUT_UB) % 32 == 0);
 }  // namespace qsfa_tiled

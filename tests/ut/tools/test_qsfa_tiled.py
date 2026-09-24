@@ -6,6 +6,7 @@ are verified here. Device correctness remains gated by the existing A5 runner.
 """
 
 import ctypes
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,6 +23,8 @@ from benchmarks.qsfa_q8c4_o8 import compare, packing, run
 ROOT = Path(__file__).resolve().parents[3]
 CPP = r"""
 #include <cstdint>
+#include <cstddef>
+#include <type_traits>
 #define __simt_vf__
 #define __aicore__
 #define LAUNCH_BOUND(x)
@@ -48,6 +51,35 @@ extern "C" uint32_t constants(uint32_t i) {
 }
 """
 
+# Compile the actual host launch wrappers with the ASC launch syntax replaced
+# by a recorder. This checks the launch's UB reservation, which guard bytes in
+# the producer tests alone cannot check. No device execution is simulated.
+LAUNCH_RECORDER = r"""
+using aclrtStream = void*;
+using GM_ADDR = uint8_t*;
+static uint32_t launchRecord[4];
+struct RecordedLaunch {
+    template <typename... Args> void operator()(Args...) const {}
+};
+template <typename Size>
+RecordedLaunch recordLaunch(uint32_t id, uint32_t blocks, Size ub, aclrtStream) {
+    launchRecord[id * 2] = blocks;
+    if constexpr (std::is_same_v<Size, std::nullptr_t>) launchRecord[id * 2 + 1] = 0;
+    else launchRecord[id * 2 + 1] = uint32_t(ub);
+    return {};
+}
+"""
+LAUNCH_TEST = r"""
+extern "C" uint32_t launch_info(uint32_t h, uint32_t s, uint32_t i) {
+    uint32_t m = ((h + 15) / 16) * 16;
+    qsfa_qk_tiled_launch(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, h, m, s, s);
+    qsfa_pv_tiled_launch(nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, h, m, s, s);
+    return launchRecord[i];
+}
+"""
+
 
 class TiledProducerTests(unittest.TestCase):
     @classmethod
@@ -58,7 +90,13 @@ class TiledProducerTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(temporary.cleanup)
         source, library = Path(temporary.name) / "gather.cpp", Path(temporary.name) / "gather.so"
-        source.write_text(CPP)
+        tiled = (ROOT / "benchmarks/qsfa_q8c4_o8/csrc/tiled.asc").read_text()
+        launchers = tiled[tiled.index('extern "C" void qsfa_qk_tiled_launch') :]
+        for kernel, index in (("QkTiledKernel", 0), ("PvTiledKernel", 1)):
+            launchers, count = re.subn(rf"{kernel}<<<([^>]+)>>>", rf"recordLaunch({index}, \1)", launchers)
+            if count != 1:
+                raise AssertionError(f"Expected one actual {kernel} launch, found {count}")
+        source.write_text(CPP + LAUNCH_RECORDER + launchers + LAUNCH_TEST)
         subprocess.run(
             [
                 compiler,
@@ -84,6 +122,23 @@ class TiledProducerTests(unittest.TestCase):
         cls.lib.constants.argtypes = [ctypes.c_uint32]
         cls.lib.constants.restype = ctypes.c_uint32
         cls.offsets = [cls.lib.constants(i) for i in range(8)]
+        cls.lib.launch_info.argtypes = [ctypes.c_uint32] * 3
+        cls.lib.launch_info.restype = ctypes.c_uint32
+
+    def test_actual_launches_reserve_ub_for_each_vector_core(self):
+        for h in (8, 16, 32, 64):
+            for s in (128, 2048, 8192):
+                with self.subTest(heads=h, selected=s):
+                    qk_blocks, qk_ub, pv_blocks, pv_ub = [self.lib.launch_info(h, s, i) for i in range(4)]
+                    m = ((h + 15) // 16) * 16
+                    self.assertEqual(qk_blocks, min((m // 16) * (s // 64), 32))
+                    self.assertEqual(pv_blocks, min((m // 16) * 8, 32))
+                    # Independently derived maximum byte endpoints for the two
+                    # stages, including PV's separate Fixpipe output region.
+                    for used, reserved in ((31488, qk_ub), (8192 + 8 * 64 * 4, pv_ub)):
+                        self.assertGreaterEqual(reserved, used)
+                        self.assertLessEqual(reserved, (256 - 8 - 32) * 1024)
+                        self.assertEqual(reserved % 32, 0)
 
     @staticmethod
     def inverse_nz(data, rows, reduction, c0):

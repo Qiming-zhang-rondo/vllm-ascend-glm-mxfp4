@@ -1,6 +1,6 @@
 # A5 Q8/C4/O8 QSFA 算子原型
 
-这是 **Ascend C 设备代码**，通过独立 Torch `.so` 执行。现在包含两条路径：默认 `tiled` 为新增的三个 kernel 分块版本，尚待 A5 编译及数值/性能验证；`prototype` 为原来的五个 kernel 版本，已在用户的 A5/CANN9.1.1 容器完成默认 shape 的计算正确性与同步 wall 耗时验证。两者都不是完整的单 kernel FlashAttention。只做单算子；没有修改 VA/AV、模型或现有 CANN OPP。
+这是 **Ascend C 设备代码**，通过独立 Torch `.so` 执行。现在包含两条路径：默认 `tiled` 为新增的三个 kernel 分块版本，首轮 A5 执行出现 UB 越界，动态 UB 预留修正后仍待 A5 复测；`prototype` 为原来的五个 kernel 版本，已在用户的 A5/CANN9.1.1 容器完成默认 shape 的计算正确性与同步 wall 耗时验证。两者都不是完整的单 kernel FlashAttention。只做单算子；没有修改 VA/AV、模型或现有 CANN OPP。
 
 ## 在现有 A5 容器中执行
 
@@ -48,6 +48,10 @@ git -C /workspace/qsfa-a5-optest pull --ff-only && bash /workspace/qsfa-a5-optes
 KV cache始终是C4 NoPE+BF16 RoPE；BF16 V只是计算时的片上临时数据。新路径不分配完整展开K、转置V或FP32输出acc的GM缓冲，临时及输出申请由13次降为5次。保留相同数值边界和量化门槛，不静默退回旧实现。**仍保留scores/P的GM读写，以及保守单缓冲同步；没有实现官方完整在线softmax多槽流水，也没有已测提速结论。** QK和PV会分别读取C4 cache，收益需实测。
 
 片上数据预算（固定M16/N64/K128）：QK L1=52480B、每AIV UB=31488B；PV L1=20480B、每AIV UB=10240B。L0A/B分别按最大BF16的4096/16384B使用，L0C=4096B。E8M0 scale按B16字节对的DN2NZ布局独立计算；数据NZ和scale NZ不能混用。
+
+**2026-09-24 UB 越界修正**：`d28632691` 首轮运行报 AIV error341（VEC访问UB越界），没有产生新版精度或性能结果。源码检查发现 QK/PV 的 `<<<blocks, nullptr, stream>>>` 没有预留动态 UB，却访问上述片上缓冲区。现在两个启动入口均传入32KiB，编译期检查覆盖全部缓冲区且不超过混合SIMT的216KiB上限。CPU回归直接提取实际host启动函数并记录其配置，检查所有支持H、代表性selected及两个kernel的预留大小；原有producer数值/guard检查无法发现这个启动缺口。编译probe也覆盖带UB指针的混合SIMT调用和非零UB启动参数。该修改有源码依据，但消除此设备错误以及后续正确性/耗时仍需A5复测，不宣称已通过。
+
+依据：`cann/asc-devkit` **9.1.0 / `6e439c1823802a48877d03f3eb1057848f195065`** 的 [SIMD/SIMT kernel启动合同](https://gitcode.com/cann/asc-devkit/blob/6e439c1823802a48877d03f3eb1057848f195065/docs/en/api/SIMT-API/SIMD_SIMT_hybrid_programming_intro/extended_syntax/kernel_function_config_147.md)、[官方gather样例](https://gitcode.com/cann/asc-devkit/blob/6e439c1823802a48877d03f3eb1057848f195065/examples/05_simd_simt_hybrid/00_introduction/simd_simt_gather_and_adds/gather_and_adds.asc) 的host launch，以及 `impl/basic_api/kernel_tensor_impl.h::LocalTensor/CreateTensor`（仅记录地址和大小，不执行host侧UB预留）。当前手工布局从物理UB地址0开始，AIC Fixpipe与AIV使用同一偏移；禁止混入会移动动态内存基址的静态 `__ubuf__` 数组。
 
 同步沿官方 `attn_buffer.h` 的mode4协议：AIV0/1分别发布READY，AIC等待两侧并在LoadData消费后释放L1；PV最终输出另有OUT_READY/OUT_FREE握手。退出前消耗最后一轮release/free，H8的空白半块仍完整参与同步。每个未消费flag计数上限为1，不使用Matmul高阶API内部flag。
 
@@ -135,4 +139,4 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 `tiled_gather.h` 的实际producer函数由宿主C++测试执行，独立逆布局核对K/Q payload、成对scale、RoPE和BF16 V，覆盖四种head数、非均匀scale、不同稀疏位置及非法索引。这些是CPU合同检查，不能验证NPU指令、实际DMA布局、跨核同步或提速。
 
-本次本地回归：全部QSFA工具测试70项及50个子测试通过；Ruff check/format、shell语法及diff检查通过。完整仓库格式检查因缺少pre-commit未运行。没有本地CANN编译器或A5，因此新版尚未完成设备编译与运行验证。
+本次UB修正本地回归：全部QSFA工具测试71项及62个子测试通过；Ruff check/format、shell语法及diff检查通过。完整仓库格式检查因缺少pre-commit未运行。没有本地CANN编译器或A5，因此本次修正尚未完成设备编译与运行验证。
