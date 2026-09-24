@@ -81,14 +81,14 @@ OfficialResult official_forward(const at::Tensor& q, const at::Tensor& cache, co
     const char* soc = aclrtGetSocName();
     TORCH_CHECK(soc && std::strncmp(soc,"Ascend950",9)==0, "official experiment requires A5/Ascend950");
     for (const auto* tensor : {&q, &cache, &idx, &table, &cuq, &kvlen})
-        qsfa_storage::require_nd_format(*tensor);
+        qsfa_storage::require_linear_base_format(*tensor);
     const auto h = q.size(Candidate ? 0 : 1);
     const auto bytes = q.options().dtype(at::kByte);
     auto workspace = at::empty({idx.numel() * 8}, bytes);
     auto packed = Candidate ? at::empty({h,544}, bytes) : at::empty({1,h,512}, q.options());
     auto empty = at::empty({0}, bytes);
     auto status = at::zeros({1}, bytes.dtype(at::kInt));
-    for (const auto* tensor : {&workspace, &packed, &status}) qsfa_storage::require_nd_format(*tensor);
+    for (const auto* tensor : {&workspace, &packed, &status}) qsfa_storage::require_linear_base_format(*tensor);
     const auto npu_stream = c10_npu::getCurrentNPUStream();
     const auto stream = npu_stream.stream(true);
     for (const auto* tensor : std::initializer_list<const at::Tensor*>{

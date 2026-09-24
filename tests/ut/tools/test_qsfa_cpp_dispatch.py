@@ -38,7 +38,7 @@ static int64_t fake_format(const at::Tensor& tensor) {
 
 static bool rejects_format(int64_t format) {
     try {
-        qsfa_storage::require_nd_format(format_tensor(format));
+        qsfa_storage::require_linear_base_format(format_tensor(format));
     } catch (const c10::Error& error) {
         const std::string message(error.what_without_backtrace());
         if (message.find("ND") == std::string::npos) {
@@ -49,13 +49,24 @@ static bool rejects_format(int64_t format) {
     return false;
 }
 
+static void check_rejected_layout(const at::Tensor& tensor) {
+    try {
+        qsfa_storage::require_linear_base_format(tensor);
+    } catch (const c10::Error& error) {
+        const std::string message(error.what_without_backtrace());
+        if (message.find("contiguous with zero storage offset") == std::string::npos) throw;
+        return;
+    }
+    throw std::runtime_error("Unsupported raw storage layout was accepted");
+}
+
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "lifecycle";
         if (mode == "missing" || mode == "lifecycle") {
             bool rejected = false;
             try {
-                qsfa_storage::require_nd_format(format_tensor(2));
+                qsfa_storage::require_linear_base_format(format_tensor(2));
             } catch (const c10::Error& error) {
                 const std::string message(error.what_without_backtrace());
                 if (message.find("npu::get_npu_format") == std::string::npos) throw;
@@ -81,16 +92,25 @@ int main(int argc, char** argv) {
         if (dispatcher.call(format_tensor(wide_value)) != wide_value) {
             throw std::runtime_error("Dispatcher int return was truncated");
         }
-        qsfa_storage::require_nd_format(format_tensor(2));
+        qsfa_storage::require_linear_base_format(format_tensor(2));
+        qsfa_storage::require_linear_base_format(format_tensor(0));
         if (mode == "reject" || mode == "lifecycle") {
-            if (!rejects_format(29) || !rejects_format(-1) || !rejects_format(wide_value)) {
-                throw std::runtime_error("Non-ND storage format was accepted");
+            for (auto format : {int64_t{1}, int64_t{3}, int64_t{4}, int64_t{29}, int64_t{-1}, wide_value}) {
+                if (!rejects_format(format)) {
+                    throw std::runtime_error("Unsupported storage format was accepted");
+                }
             }
             // A valid cached operator handle must dispatch each new tensor;
             // neither the previous error nor previous format may be cached.
-            qsfa_storage::require_nd_format(format_tensor(2));
+            qsfa_storage::require_linear_base_format(format_tensor(2));
+            qsfa_storage::require_linear_base_format(format_tensor(0));
         }
-        std::cout << mode << " passed: int64 schema; ND accepted; required rejects checked\n";
+        if (mode == "layout" || mode == "lifecycle") {
+            auto storage = at::zeros({12}, at::TensorOptions().dtype(at::kLong));
+            check_rejected_layout(storage.view({3,4}).transpose(0,1));
+            check_rejected_layout(storage.narrow(0,1,1));
+        }
+        std::cout << mode << " passed: int64 schema; ND/NCHW accepted; required rejects checked\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -137,11 +157,14 @@ class CppStorageFormatDispatchTests(unittest.TestCase):
     def test_missing_operator_is_not_silently_accepted(self):
         self.run_case("missing", "missing-op rejected")
 
-    def test_registered_int64_schema_accepts_nd(self):
+    def test_registered_int64_schema_accepts_nd_and_nchw(self):
         self.run_case("nd", "nd passed")
 
     def test_nz_negative_and_wide_integer_formats_are_rejected(self):
         self.run_case("reject", "reject passed")
+
+    def test_noncontiguous_and_nonzero_offset_storage_is_rejected(self):
+        self.run_case("layout", "layout passed")
 
     def test_registration_after_missing_lookup_recovers_and_checks_each_tensor(self):
         self.run_case("lifecycle", "lifecycle passed")

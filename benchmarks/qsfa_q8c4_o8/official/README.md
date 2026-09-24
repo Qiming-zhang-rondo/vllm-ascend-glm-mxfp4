@@ -108,3 +108,11 @@ The initial `__ASC_NPU_HOST__`-only guard was incomplete: CANN also uses
 The report alone does not identify that pass as host or AIV. Compile regression
 fixtures now omit `PIPE_FIX` for all non-Cube cases, including a macro-less
 host case; only the Cube fixture supplies it and checks the real FIX selection.
+
+A5 feedback for `fe292cbce` confirms library compilation and registration.
+The first FP8 control call then stopped before launch on the binding's
+ND-only check (`got format 0`). The shared raw-storage check now permits
+contiguous, zero-offset NCHW(0) as well as ND(2), including internally allocated
+BF16 output; both are linear base formats. Capacity is checked and opaque
+NZ/FRACTAL formats remain rejected. No format conversion is added to timing.
+Device compute correctness and performance are still pending.

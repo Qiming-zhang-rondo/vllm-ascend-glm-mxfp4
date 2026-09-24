@@ -49,10 +49,10 @@ void check_contract(const at::Tensor& q, const at::Tensor& qs,
     }
 }
 
-void require_nd(const at::Tensor& tensor)
+void require_linear_storage(const at::Tensor& tensor)
 {
     TORCH_CHECK(tensor.is_privateuseone(), "all runtime inputs and allocations must be on NPU");
-    qsfa_storage::require_nd_format(tensor);
+    qsfa_storage::require_linear_base_format(tensor);
 }
 
 Result meta(const at::Tensor& q, const at::Tensor& qs, const at::Tensor& kv,
@@ -70,7 +70,7 @@ Result forward(const at::Tensor& q, const at::Tensor& qs, const at::Tensor& kv,
                double scale)
 {
     check_contract(q, qs, kv, ks, rope, indices, scale);
-    for (const auto* tensor : {&q, &qs, &kv, &ks, &rope, &indices}) require_nd(*tensor);
+    for (const auto* tensor : {&q, &qs, &kv, &ks, &rope, &indices}) require_linear_storage(*tensor);
     const c10_npu::NPUGuard guard(q.device());
     const char* soc = aclrtGetSocName();
     TORCH_CHECK(soc != nullptr && std::strncmp(soc, "Ascend950", 9) == 0,
@@ -88,7 +88,7 @@ Result forward(const at::Tensor& q, const at::Tensor& qs, const at::Tensor& kv,
     auto output = at::empty({h, 512}, bytes), output_scale = at::empty({h, 16}, bytes);
     auto status = at::empty({1}, bytes.dtype(at::kInt));
     for (const auto* tensor : {&qn, &qns, &qr, &kn, &kns, &kr, &vt, &scores, &p,
-                              &acc, &output, &output_scale, &status}) require_nd(*tensor);
+                              &acc, &output, &output_scale, &status}) require_linear_storage(*tensor);
 
     // Flush torch_npu's host task queue after allocations, then launch all stages
     // onto that same stream. This does not synchronize the device.
@@ -120,7 +120,7 @@ Result forward_tiled(const at::Tensor& q, const at::Tensor& qs, const at::Tensor
                      double scale)
 {
     check_contract(q, qs, kv, ks, rope, indices, scale);
-    for (const auto* tensor : {&q, &qs, &kv, &ks, &rope, &indices}) require_nd(*tensor);
+    for (const auto* tensor : {&q, &qs, &kv, &ks, &rope, &indices}) require_linear_storage(*tensor);
     const c10_npu::NPUGuard guard(q.device());
     const char* soc = aclrtGetSocName();
     TORCH_CHECK(soc != nullptr && std::strncmp(soc, "Ascend950", 9) == 0,
@@ -132,7 +132,7 @@ Result forward_tiled(const at::Tensor& q, const at::Tensor& qs, const at::Tensor
     auto p = at::empty({m, s}, bytes.dtype(at::kBFloat16));
     auto output = at::empty({h, 512}, bytes), output_scale = at::empty({h, 16}, bytes);
     auto status = at::empty({1}, bytes.dtype(at::kInt));
-    for (const auto* tensor : {&scores, &p, &output, &output_scale, &status}) require_nd(*tensor);
+    for (const auto* tensor : {&scores, &p, &output, &output_scale, &status}) require_linear_storage(*tensor);
     const auto npu_stream = c10_npu::getCurrentNPUStream();
     const auto stream = npu_stream.stream(true);
     for (const at::Tensor* tensor : std::initializer_list<const at::Tensor*>{

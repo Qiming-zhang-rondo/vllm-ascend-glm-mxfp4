@@ -168,6 +168,16 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 加载修复本地验证：49项及31个子测试通过，包含实际编译、链接、运行 CPU libtorch 的 C++ Dispatcher 测试（ND接受、NZ拒绝、int64返回值、schema缺失及随后注册），以及加载失败时不生成成功 manifest 的回归。该测试没有 torch_npu/A5，不代表设备验证。
 
+2026-09-24 官方融合路径后续 A5 日志：`fe292cbce` 完成编译、链接和库加载，
+但 FP8 source control 在 launch 前被上述严格 ND 检查拒绝（`got format 0`）。
+这是包装层把 NCHW 基础格式误判为不支持；尚未执行该内核。
+现已对输入和内部输出/workspace 统一接受连续、零偏移的 ND(2)/NCHW(0)，
+并检查存储容量；NZ/FRACTAL 及其他格式仍拒绝。依据是现有
+`csrc/aclnn_torch_adapter/op_api_common.h::IsOpInputBaseFormat` 的基础格式处理。
+没有增加格式转换、修改量化/golden 或放宽精度门槛。CPU libtorch 的真实 helper
+回归先复现了 format 0 拒绝，再验证 ND/NCHW 接受、非连续/偏移视图及不支持格式拒绝；
+修正后的 A5 compute 和性能仍待执行。
+
 随后用户提供的 `link.txt` 确认本容器使用 ASC CMake 编译 `.asc`、使用 `/usr/bin/c++` 最终链接，而不是直接 bisheng 后备路径，因此没有 `toolchain_probe.log`。原链接命令缺少 Ascend C runtime 的完整依赖；容器内 `libprofapi.so` 导出 `MsprofReportApi`，`libmmpa.so` 导出 `mmGetTid`，库本身不缺失。构建现按 [CANN 9.1 内置库清单](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/programug/Ascendcopdevg/docs/en/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation_basic_usage.md) 显式链接静态 `ascendc_runtime` 及其后的共享依赖 `runtime/profapi/unified_dlog/mmpa/ascend_dump/c_sec/error_manager/ascendcl`。两条构建路径使用同一列表，保留未定义符号检查及构建后的真实加载检查，不通过忽略链接错误来绕过问题。
 
 2026-09-24 用户 A5 实测默认 shape：候选输出与 decoded-payload golden 完全一致；同步 wall p50=0.500839ms、mean=0.473957ms（warmup5/iters20）。相对原始 BF16 的 relative RMSE=0.115499，量化筛选仍失败；相对 C4/BF16 reference 的新增 relative RMSE=0.042727，通过增量筛选。这份旧日志没有原生 QSFA 耗时，不能推导加速比。
