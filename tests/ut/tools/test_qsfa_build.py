@@ -141,6 +141,8 @@ class QsfaBuildDiscoveryTests(unittest.TestCase):
             "build.py",
             "csrc/vector.asc",
             "csrc/matmul.asc",
+            "csrc/tiled.asc",
+            "csrc/tiled_layout.h",
             "csrc/torch_binding.cpp",
             "csrc/launch.h",
         ):
@@ -151,7 +153,7 @@ class QsfaBuildDiscoveryTests(unittest.TestCase):
         fake_torch._C = types.SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True)
         fake_torch.ops = types.SimpleNamespace(
             load_library=lambda path: self.assertTrue(Path(path).is_file()),
-            qsfa_q8c4_o8=types.SimpleNamespace(forward=object()),
+            qsfa_q8c4_o8=types.SimpleNamespace(forward=object(), forward_tiled=object()),
         )
         fake_npu = types.ModuleType("torch_npu")
         fake_npu.__version__ = "fixture-2.10"
@@ -271,7 +273,10 @@ class QsfaBuildDiscoveryTests(unittest.TestCase):
             self.fail("Build validation must not dispatch compute")
 
         torch = types.SimpleNamespace(
-            ops=types.SimpleNamespace(load_library=calls.append, qsfa_q8c4_o8=types.SimpleNamespace(forward=compute))
+            ops=types.SimpleNamespace(
+                load_library=calls.append,
+                qsfa_q8c4_o8=types.SimpleNamespace(forward=compute, forward_tiled=compute),
+            )
         )
         build._verify_library_load(torch, self.root / "example.so")
         self.assertEqual(calls, [str(self.root / "example.so")])

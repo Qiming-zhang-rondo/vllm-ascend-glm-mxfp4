@@ -92,6 +92,7 @@ def worker_command(args, variant, snapshot, output):
         str(output),
     ]
     for flag, value in (
+        ("--implementation", args.implementation),
         ("--warmup", args.warmup),
         ("--iters", args.iters),
         ("--device", args.device),
@@ -192,7 +193,7 @@ def run(args):
             "mean_latency_reduction_percent": (1.0 - cp["mean_ms"] / bp["mean_ms"]) * 100.0,
             "interpretation": "Ratio <1 and negative latency reduction mean the candidate is slower",
             "scope": "Full synchronized operator wall calls; see each report for included stages and cache dtype",
-            "candidate_contract": "Q8/MXFP4 cache/O8 custom prototype",
+            "candidate_contract": f"Q8/MXFP4 cache/O8 custom {args.implementation}",
             "baseline_contract": "Installed native QSFA; its cache/output contract is recorded in the baseline report",
         }
         report["compute_verified"] = True

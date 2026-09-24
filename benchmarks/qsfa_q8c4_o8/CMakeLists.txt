@@ -69,7 +69,7 @@ if(QSFA_BISHENG)
     # bisheng performs the final device/host link, using the same installation.
     target_link_options(qsfa_q8c4_o8 PRIVATE --npu-arch=dav-3510)
 else()
-    add_library(qsfa_q8c4_o8 SHARED csrc/torch_binding.cpp csrc/vector.asc csrc/matmul.asc)
+    add_library(qsfa_q8c4_o8 SHARED csrc/torch_binding.cpp csrc/vector.asc csrc/matmul.asc csrc/tiled.asc)
 endif()
 target_include_directories(qsfa_q8c4_o8 PRIVATE
     csrc ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_ROOT}/include" ${QSFA_CANN_INCLUDES})

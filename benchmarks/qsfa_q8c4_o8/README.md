@@ -1,6 +1,6 @@
 # A5 Q8/C4/O8 QSFA 算子原型
 
-这是 **Ascend C 设备代码**，通过独立 Torch `.so` 执行。当前是五个串行 kernel 的研究原型，已在用户的 A5/CANN9.1.1 容器完成默认 shape 的计算正确性与同步 wall 耗时验证，不是已完成优化的融合 QSFA。只做单算子；没有修改 VA/AV、模型或现有 CANN OPP。
+这是 **Ascend C 设备代码**，通过独立 Torch `.so` 执行。现在包含两条路径：默认 `tiled` 为新增的三个 kernel 分块版本，尚待 A5 编译及数值/性能验证；`prototype` 为原来的五个 kernel 版本，已在用户的 A5/CANN9.1.1 容器完成默认 shape 的计算正确性与同步 wall 耗时验证。两者都不是完整的单 kernel FlashAttention。只做单算子；没有修改 VA/AV、模型或现有 CANN OPP。
 
 ## 在现有 A5 容器中执行
 
@@ -10,17 +10,17 @@
 git -C /workspace/qsfa-a5-optest pull --ff-only && bash /workspace/qsfa-a5-optest/benchmarks/qsfa_q8c4_o8/run_qsfa.sh
 ```
 
-脚本复用或编译局部 `.so`，默认对比新原型与容器现有的 **BF16 Q/O、FP8 KV QSFA**：共享同一份原始输入、稀疏索引和 attention scale，分别在独立进程中通过计算正确性检查后计时。复用容器的 Python、torch、torch_npu、CANN、CMake 和 C++ 编译器；缺依赖直接说明，不下载、不 pip install、不重编 VA。源码、编译环境和产物摘要匹配时复用已有 `.so`；本次只新增 Python 对照测试，不改变已编译算子的源码或构建摘要。
+脚本复用或编译局部 `.so`，默认对比新原型与容器现有的 **BF16 Q/O、FP8 KV QSFA**：共享同一份原始输入、稀疏索引和 attention scale，分别在独立进程中通过计算正确性检查后计时。复用容器的 Python、torch、torch_npu、CANN、CMake 和 C++ 编译器；缺依赖直接说明，不下载、不 pip install、不重编 VA。源码、编译环境和产物摘要匹配时复用已有 `.so`；本次新增设备源码，因此首次更新后会编译这个独立 `.so`；随后摘要匹配时复用。
 
 构建支持已安装的 `ASCConfig.cmake` / `FindASC.cmake`，也支持缺少该 CMake 包但有原生 `bisheng` 的容器。后者自动使用同一 CANN 目录内的编译器、头文件和库；先编译、链接一个包含 Cube、SIMT VF 和 host launch 的最小样例，**不执行设备代码**，再编译实际算子。只存在旧 `ascendc.cmake` 不证明原生 `.asc` 语法可用，须由这个编译检查确认；失败的编译器输出保存在 `.build/<摘要>/toolchain_probe.log`。同一 CANN 内若有多个不同的 `bisheng`，检查失败后尝试下一个；实际算子编译失败则直接停止。不会跨 CANN 版本混用工具链或安装 SDK。
 
-这两份源码使用 SIMD/Cube 和 SIMD 内调用 SIMT VF，构建不使用纯 SIMT 的 `--enable-simt`。参见[官方原生编译说明](https://asc.gitcode.com/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.html)。最小样例通过仅证明基本编译、链接路径；实际 MXFP8 API 兼容性仍由后续算子编译检查，精度与性能仍须 A5 实测。
+这些源码使用 SIMD/Cube 和 SIMD 内调用 SIMT VF，构建不使用纯 SIMT 的 `--enable-simt`。参见[官方原生编译说明](https://asc.gitcode.com/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.html)。最小样例通过仅证明基本编译、链接路径；实际 MXFP8 API 兼容性仍由后续算子编译检查，精度与性能仍须 A5 实测。
 
 构建后还会用当前 Python/torch_npu 加载 `.so` 并检查算子注册，成功后才写入构建 manifest；这一检查不调用设备 kernel。加载成功也不等于精度通过。
 
 默认：**Q=1、H=8、K=8192、selected=2048、D=576（NoPE512+RoPE64）**，seed=20260921。H 是单卡本地 head 数。当前仅支持单序列、单 KV head、decode，H∈{8,16,32,64}，selected∈[128,8192] 且为128的倍数。K 可以更长；selected 是实际参与 attention 的稀疏 token 数。
 
-可选参数：`--build-only`、`--candidate-only`、`--jobs 4`、`--python /path/to/python`、`--profile`、`--heads 16`、`--key-tokens 57344`、`--selected-tokens 2048`。`--profile` 为两组各额外采一轮完整调用的 CPU/NPU trace；`--candidate-only` 保留此前只测新原型的行为。这里不运行此前超时的 INT8 baseline；新对照使用已核对的 A5 FP8 cache 合同，但仍需要容器实测，不能据此宣称此前 timeout 根因已解决。
+可选参数：`--implementation tiled`（默认）、`--implementation prototype`（原五阶段对照）、`--build-only`、`--candidate-only`、`--jobs 4`、`--python /path/to/python`、`--profile`、`--heads 16`、`--key-tokens 57344`、`--selected-tokens 2048`。`--profile` 为两组各额外采一轮完整调用的 CPU/NPU trace；`--candidate-only` 保留此前只测新原型的行为。这里不运行此前超时的 INT8 baseline；新对照使用已核对的 A5 FP8 cache 合同，该 FP8 基线已在用户容器通过默认 shape 测试，不能据此宣称此前 INT8 timeout 根因已解决。
 
 每次运行记录在本目录 `.runs/<时间-PID>/`：`run.log`、`build.json`、`results.json`、`candidate.json`、`native_baseline.json`、共享输入快照、`plog/`，可选 profiler 子目录。编译产物为 `.build/<摘要>/libqsfa_q8c4_o8.so`。启动 Python 前设置 `FLA_NPU_DISABLE_PTH=1`、`TORCH_DEVICE_BACKEND_AUTOLOAD=0`、`ASCEND_LAUNCH_BLOCKING=1`。
 
@@ -39,6 +39,20 @@ git -C /workspace/qsfa-a5-optest pull --ff-only && bash /workspace/qsfa-a5-optes
 
 ## 实际计算路径
 
+默认 `--implementation tiled` 调用 `torch.ops.qsfa_q8c4_o8.forward_tiled`：
+
+1. **QkTiledKernel / mixed AIC+AIV**：按 M16/N64 tile 在 UB 读取稀疏 C4、展开 E4M3 和成对 E8M0 scale，送到 L1；Cube 执行原有 K128 顺序的 NoPE MXFP8 QK及BF16 RoPE QK，FP32累加。scores仍写GM。
+2. **SoftmaxKernel / SIMT**：复用原版完整 selected 行的 softmax，P仍舍入BF16并写GM。
+3. **PvTiledKernel / mixed AIC+AIV**：每次读取128个selected token、64个输出通道，C4 V在UB解码并局部转置后直接送L1；BF16 PV沿原顺序累加FP32。最终结果经Fixpipe直接到两侧AIV的UB，再生成O8 payload/scale，没有独立输出kernel。
+
+KV cache始终是C4 NoPE+BF16 RoPE；BF16 V只是计算时的片上临时数据。新路径不分配完整展开K、转置V或FP32输出acc的GM缓冲，临时及输出申请由13次降为5次。保留相同数值边界和量化门槛，不静默退回旧实现。**仍保留scores/P的GM读写，以及保守单缓冲同步；没有实现官方完整在线softmax多槽流水，也没有已测提速结论。** QK和PV会分别读取C4 cache，收益需实测。
+
+片上数据预算（固定M16/N64/K128）：QK L1=52480B、每AIV UB=31488B；PV L1=20480B、每AIV UB=10240B。L0A/B分别按最大BF16的4096/16384B使用，L0C=4096B。E8M0 scale按B16字节对的DN2NZ布局独立计算；数据NZ和scale NZ不能混用。
+
+同步沿官方 `attn_buffer.h` 的mode4协议：AIV0/1分别发布READY，AIC等待两侧并在LoadData消费后释放L1；PV最终输出另有OUT_READY/OUT_FREE握手。退出前消耗最后一轮release/free，H8的空白半块仍完整参与同步。每个未消费flag计数上限为1，不使用Matmul高阶API内部flag。
+
+原版 `--implementation prototype` 调用 `forward`，计算路径保持不变：
+
 1. **GatherKernel / SIMT**：根据给定稀疏索引读取 C4 cache；E2M1 数值无损展开成 E4M3，保留原 D32 E8M0 scale；同时生成 PV 使用的 BF16 V 和 BF16 RoPE。
 2. **QkKernel / Cube**：NoPE 使用 `mx_fp8_e4m3_t` 的 `LoadData + Mmad`，FP32 L0C 累加；BF16 RoPE 乘积加到同一 FP32 L0C。
 3. **SoftmaxKernel / SIMT**：FP32 scale、max、exp、sum、归一化，P 舍入 BF16。
@@ -53,7 +67,7 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 ## 输入、输出合同
 
-调用 `torch.ops.qsfa_q8c4_o8.forward(q, qs, kv, ks, rope, indices, scale)`，输入均为同一 NPU 的连续 ND tensor，storage offset=0。
+调用 `torch.ops.qsfa_q8c4_o8.forward_tiled(q, qs, kv, ks, rope, indices, scale)`；旧版 `forward` 使用完全相同的合同，输入均为同一 NPU 的连续 ND tensor，storage offset=0。
 
 | 参数 | shape / 存储 | 含义 |
 |---|---|---|
@@ -81,7 +95,7 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 `status=quantization_failed` 表示算完、计算正确性通过，但相对 BF16 的量化筛选未过，仍保留性能。现有随机输入的 C4 本身就可能超过10%门槛，不会放宽阈值来制造 PASS。`status=failed` 要检查 `stage/error`；`compute_verified` 只有真实 NPU 数值检查通过才为 true。
 
-候选性能测 **完整自定义调用的同步 wall latency**：包括 host dispatch/分配、五个设备 kernel 和同步，排除 CPU 量化/golden、H2D、加载、warmup、输出读回。它不是纯 kernel Task Duration；`--profile` 可以查看五个设备任务，不能只取 QK 时间代表 QSFA。默认对照还会测原生 QSFA 的完整调用；只有两组实际运行并通过各自的计算正确性检查，才报告加速比。
+候选性能测 **完整自定义调用的同步 wall latency**：包括 host dispatch/分配、选中路径的全部设备 kernel 和同步，排除 CPU 量化/golden、H2D、加载、warmup、输出读回。它不是纯 kernel Task Duration；`--profile` 可以查看选中路径的全部设备任务，不能只取 QK 时间代表 QSFA。默认对照还会测原生 QSFA 的完整调用；只有两组实际运行并通过各自的计算正确性检查，才报告加速比。
 
 可用 `--input /path/inputs.pt` 重放 `torch.save` 的 `{query:[1,H,576], kv:[K,576], indices:[1,selected], scale_value:float}`，张量在 CPU。输入先舍入 BF16；无自动模型抓取。单次 decode 的 Q=1 与生成1024个输出 token 是两个概念。
 
@@ -110,4 +124,15 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 新增原生对照的本地验证：8个相关测试文件共65项和42个子测试通过，覆盖 PA656 字节/scale/页边界、官方 golden、原生数值失败禁止计时、共享输入、两侧量化失败保留状态，以及减速和基线失败的汇总行为。Ruff、shell语法及 diff 检查通过；完整仓库格式检查仍因缺少 pre-commit 未运行。CPU 与 mock 测试不代表原生基线已在 A5 执行。
 
-**待 A5 验证**：新增 FP8 原生 QSFA 对照与加速比、更多输入及设备任务耗时。尚未支持 torch.compile/ACLGraph、prefill、多batch、框架接入或端到端模型验证。包含 CANN 派生代码的 `csrc/matmul.asc` 保留 CANN2.0许可，见 `CANN_LICENSE`。
+**待 A5 验证**：新增 `tiled` 的实际编译、跨核同步、计算正确性、对原生 QSFA 的加速比，以及更多输入和设备任务耗时。尚未支持 torch.compile/ACLGraph、prefill、多batch、框架接入或端到端模型验证。包含 CANN 派生代码的 `csrc/matmul.asc` 和 `csrc/tiled.asc` 保留 CANN2.0许可，见 `CANN_LICENSE`。
+
+新增tiled实现的source witnesses固定到 `cann/ops-transformer@55498d91634277d4eec912499c027818a8c167fb`：
+
+- `examples/attention/flash_attn/L0_minimal/ascend_ops/csrc/flash_attn_minimal/op_kernel/fa_kernel_interface.h::FaKernel`：raw mixed kernel入口、`InitSocState`和直接launch。
+- `attention/common/op_kernel/attn_buffer.h::WaitCrossCore/SetCrossCore`：mode4、双AIV的16偏移及双向buffer握手。
+- `attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_cube_mla_arch35.h::IterateBmm1QSFA`：FP32 Fixpipe按M分到两侧UB。
+- 同目录 `kv_quant_sparse_flash_attention_service_vector_mla_arch35.h::CopyOutKvUb2L1`：按32字节块的UB→L1 NZ分段拷贝。
+
+`tiled_gather.h` 的实际producer函数由宿主C++测试执行，独立逆布局核对K/Q payload、成对scale、RoPE和BF16 V，覆盖四种head数、非均匀scale、不同稀疏位置及非法索引。这些是CPU合同检查，不能验证NPU指令、实际DMA布局、跨核同步或提速。
+
+本次本地回归：全部QSFA工具测试70项及50个子测试通过；Ruff check/format、shell语法及diff检查通过。完整仓库格式检查因缺少pre-commit未运行。没有本地CANN编译器或A5，因此新版尚未完成设备编译与运行验证。

@@ -17,3 +17,9 @@ extern "C" void qsfa_pv_launch(
     aclrtStream stream, void* p, void* vt, void* acc, uint32_t m, uint32_t s);
 extern "C" void qsfa_output_launch(
     aclrtStream stream, void* acc, void* out, void* oscale, uint32_t h);
+extern "C" void qsfa_qk_tiled_launch(
+    aclrtStream stream, void* q, void* qs, void* kv, void* ks, void* rope, void* indices,
+    void* scores, void* status, uint32_t h, uint32_t m, uint32_t k, uint32_t s);
+extern "C" void qsfa_pv_tiled_launch(
+    aclrtStream stream, void* p, void* kv, void* ks, void* indices, void* out, void* oscale,
+    uint32_t h, uint32_t m, uint32_t k, uint32_t s);

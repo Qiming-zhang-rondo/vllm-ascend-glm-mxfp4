@@ -45,6 +45,12 @@ ARGUMENT_ORDER = ("q", "qs", "kv", "ks", "rope", "idx")
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=("candidate", "native"), default="candidate")
+    parser.add_argument(
+        "--implementation",
+        choices=("tiled", "prototype"),
+        default="tiled",
+        help="Candidate path: tiled (3 launches, on-chip K/V) or original prototype (5 launches)",
+    )
     parser.add_argument("--library", type=Path, required=True, help="Built custom torch operator shared library")
     parser.add_argument("--output", type=Path, default=Path("qsfa_q8c4_o8_results.json"))
     parser.add_argument("--heads", type=int, choices=SUPPORTED_HEADS, default=8)
@@ -98,7 +104,15 @@ def reference_outputs(decoded_query, decoded_kv, original_query, original_kv, in
     return decoded_golden, original_golden
 
 
-def load_runtime(library, device_index, *, native=False):
+def candidate_operation(implementation):
+    if implementation == "tiled":
+        return torch.ops.qsfa_q8c4_o8.forward_tiled
+    if implementation == "prototype":
+        return torch.ops.qsfa_q8c4_o8.forward
+    raise ValueError(f"Unknown candidate implementation: {implementation}")
+
+
+def load_runtime(library, device_index, *, native=False, implementation="tiled"):
     if not native and not library.is_file():
         raise FileNotFoundError(f"Custom operator library does not exist: {library}")
     import torch_npu
@@ -113,7 +127,7 @@ def load_runtime(library, device_index, *, native=False):
         operation = load_operation()
     else:
         torch.ops.load_library(str(library.resolve()))
-        operation = torch.ops.qsfa_q8c4_o8.forward
+        operation = candidate_operation(implementation)
     return (
         operation,
         device,
@@ -125,7 +139,9 @@ def load_runtime(library, device_index, *, native=False):
             "device": str(device),
             "device_name": torch.npu.get_device_name(device_index),
             "library": None if native else str(library.resolve()),
-            "api": "torch_npu.npu_kv_quant_sparse_flash_attention" if native else "torch.ops.qsfa_q8c4_o8.forward",
+            "api": "torch_npu.npu_kv_quant_sparse_flash_attention"
+            if native
+            else f"torch.ops.qsfa_q8c4_o8.{'forward_tiled' if implementation == 'tiled' else 'forward'}",
         },
     )
 
@@ -242,6 +258,13 @@ def run(args):
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "compute_verified": False,
         "performance": {"measured": False},
+        "implementation": {
+            "name": args.implementation,
+            "launches_per_call": 3 if args.implementation == "tiled" else 5,
+            "expanded_kv_in_gm": args.implementation == "prototype",
+            "scores_and_probabilities_in_gm": True,
+            "fully_fused_attention": False,
+        },
         "contract": {
             "input": "Sources rounded to BF16; Q=1; sparse indices supplied, not computed by this test",
             "query": "MXFP8 E4M3FN/E8M0 D32 including Q RoPE; scale_alg=0, RNE",
@@ -282,7 +305,9 @@ def run(args):
         )
         c4_bf16_golden = attention_reference(original_query, decoded_kv, indices, scale).bfloat16().float()[0]
         stage(args, report, "Load actual custom operator and NPU runtime")
-        operation, device, synchronize, runtime_info = load_runtime(args.library, args.device)
+        operation, device, synchronize, runtime_info = load_runtime(
+            args.library, args.device, implementation=args.implementation
+        )
         report["runtime"] = runtime_info
         stage(args, report, "Copy validated packed inputs to NPU")
         device_inputs = [prepared[name].to(device) for name in ARGUMENT_ORDER]
@@ -292,6 +317,7 @@ def run(args):
             return operation(*device_inputs, scale)
 
         stage(args, report, "First actual candidate invocation and synchronization")
+        print("IMPLEMENTATION:", json.dumps(report["implementation"]), flush=True)
         result = invoke()
         synchronize()
         stage(args, report, "Read back output and verify decoded-payload correctness")

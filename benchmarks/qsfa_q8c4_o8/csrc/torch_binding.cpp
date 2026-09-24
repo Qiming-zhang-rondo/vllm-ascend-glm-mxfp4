@@ -115,11 +115,52 @@ Result forward(const at::Tensor& q, const at::Tensor& qs, const at::Tensor& kv,
     return {output, output_scale, status};
 }
 
+Result forward_tiled(const at::Tensor& q, const at::Tensor& qs, const at::Tensor& kv,
+                     const at::Tensor& ks, const at::Tensor& rope, const at::Tensor& indices,
+                     double scale)
+{
+    check_contract(q, qs, kv, ks, rope, indices, scale);
+    for (const auto* tensor : {&q, &qs, &kv, &ks, &rope, &indices}) require_nd(*tensor);
+    const c10_npu::NPUGuard guard(q.device());
+    const char* soc = aclrtGetSocName();
+    TORCH_CHECK(soc != nullptr && std::strncmp(soc, "Ascend950", 9) == 0,
+                "The tiled QSFA experiment requires an Ascend950/A5 device");
+    const uint32_t h = q.size(0), m = ((h + 15) / 16) * 16;
+    const uint32_t k = kv.size(0), s = indices.size(0);
+    const auto bytes = q.options();
+    auto scores = at::empty({m, s}, bytes.dtype(at::kFloat));
+    auto p = at::empty({m, s}, bytes.dtype(at::kBFloat16));
+    auto output = at::empty({h, 512}, bytes), output_scale = at::empty({h, 16}, bytes);
+    auto status = at::empty({1}, bytes.dtype(at::kInt));
+    for (const auto* tensor : {&scores, &p, &output, &output_scale, &status}) require_nd(*tensor);
+    const auto npu_stream = c10_npu::getCurrentNPUStream();
+    const auto stream = npu_stream.stream(true);
+    for (const at::Tensor* tensor : std::initializer_list<const at::Tensor*>{
+            &q, &qs, &kv, &ks, &rope, &indices, &scores, &p, &output, &output_scale, &status}) {
+        c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), npu_stream);
+    }
+    qsfa_qk_tiled_launch(stream, q.data_ptr(), qs.data_ptr(), kv.data_ptr(), ks.data_ptr(),
+        rope.data_ptr(), indices.data_ptr(), scores.data_ptr(), status.data_ptr(), h, m, k, s);
+    // Keep the SAME full-row softmax and BF16 P boundary as the validated prototype.
+    qsfa_softmax_launch(stream, scores.data_ptr(), p.data_ptr(), m, s, static_cast<float>(scale));
+    qsfa_pv_tiled_launch(stream, p.data_ptr(), kv.data_ptr(), ks.data_ptr(), indices.data_ptr(),
+        output.data_ptr(), output_scale.data_ptr(), h, m, k, s);
+    return {output, output_scale, status};
+}
+
 TORCH_LIBRARY_FRAGMENT(qsfa_q8c4_o8, m)
 {
     m.def("forward(Tensor q, Tensor qs, Tensor kv, Tensor ks, Tensor rope, Tensor indices, float scale) "
           "-> (Tensor output, Tensor output_scale, Tensor status)");
+    m.def("forward_tiled(Tensor q, Tensor qs, Tensor kv, Tensor ks, Tensor rope, Tensor indices, float scale) "
+          "-> (Tensor output, Tensor output_scale, Tensor status)");
 }
-TORCH_LIBRARY_IMPL(qsfa_q8c4_o8, PrivateUse1, m) { m.impl("forward", TORCH_FN(forward)); }
-TORCH_LIBRARY_IMPL(qsfa_q8c4_o8, Meta, m) { m.impl("forward", TORCH_FN(meta)); }
+TORCH_LIBRARY_IMPL(qsfa_q8c4_o8, PrivateUse1, m) {
+    m.impl("forward", TORCH_FN(forward));
+    m.impl("forward_tiled", TORCH_FN(forward_tiled));
+}
+TORCH_LIBRARY_IMPL(qsfa_q8c4_o8, Meta, m) {
+    m.impl("forward", TORCH_FN(meta));
+    m.impl("forward_tiled", TORCH_FN(meta));
+}
 }  // namespace

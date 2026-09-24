@@ -29,7 +29,7 @@ function(qsfa_direct_objects output)
     endif()
     set(objects)
     file(GLOB kernel_headers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.h")
-    foreach(name vector matmul)
+    foreach(name vector matmul tiled)
         set(obj "${CMAKE_CURRENT_BINARY_DIR}/${name}.asc.o")
         # Each translation unit contains all its device callees; -c embeds the
         # complete kernel and host launch stub, no cross-file device calls.

@@ -99,6 +99,7 @@ def _verify_library_load(torch, library):
     print("Checking QSFA shared-library load and registration (no NPU execution)", flush=True)
     torch.ops.load_library(str(library))
     _ = torch.ops.qsfa_q8c4_o8.forward
+    _ = torch.ops.qsfa_q8c4_o8.forward_tiled
 
 
 def build_library(jobs=4, *, _remaining_compilers=None):
@@ -130,7 +131,7 @@ def build_library(jobs=4, *, _remaining_compilers=None):
         raise RuntimeError("Installed torch_npu is missing extension headers: " + ", ".join(missing))
     sources = [ROOT / "CMakeLists.txt", ROOT / "build.py"] + sorted((ROOT / "cmake").rglob("*.*"))
     sources += sorted(file for file in (ROOT / "csrc").rglob("*") if file.is_file())
-    for name in ("vector.asc", "matmul.asc", "torch_binding.cpp", "launch.h"):
+    for name in ("vector.asc", "matmul.asc", "tiled.asc", "tiled_layout.h", "torch_binding.cpp", "launch.h"):
         if not (ROOT / "csrc" / name).is_file():
             raise RuntimeError(f"Incomplete prototype source: csrc/{name}")
     compiler_paths = []
