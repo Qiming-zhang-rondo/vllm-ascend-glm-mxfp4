@@ -149,11 +149,14 @@ class QsfaBuildDiscoveryTests(unittest.TestCase):
         fake_torch.__version__ = "fixture-2.10"
         fake_torch.__file__ = str(self.make_file("torch/__init__.py"))
         fake_torch._C = types.SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True)
+        fake_torch.ops = types.SimpleNamespace(
+            load_library=lambda path: self.assertTrue(Path(path).is_file()),
+            qsfa_q8c4_o8=types.SimpleNamespace(forward=object()),
+        )
         fake_npu = types.ModuleType("torch_npu")
         fake_npu.__version__ = "fixture-2.10"
         fake_npu.__file__ = str(self.make_file("torch_npu/__init__.py"))
         for header in (
-            "NPUBridge.h",
             "npu/NPUStream.h",
             "npu/NPUGuard.h",
             "npu/NPUCachingAllocator.h",
@@ -204,6 +207,7 @@ class QsfaBuildDiscoveryTests(unittest.TestCase):
             manifest = json.loads((configured[1] / "manifest.json").read_text())
             self.assertEqual(manifest["fingerprint"], result["fingerprint"])
             self.assertFalse(result["reused"])
+            self.assertTrue(result["load_verified"])
             self.assertEqual(len(list(project.rglob("libqsfa_q8c4_o8.so"))), 1)
 
     def test_kernel_build_failure_is_not_retried_or_marked_installed(self):
@@ -242,6 +246,35 @@ class QsfaBuildDiscoveryTests(unittest.TestCase):
                 build.build_library()
             self.assertEqual(execute.call_count, 1)
             self.assertFalse(list(project.rglob("manifest.json")))
+
+    def test_built_library_that_cannot_load_has_no_success_manifest(self):
+        with self.mocked_build_environment() as (project, _, _, _):
+
+            def fake_cmake(command, *, check):
+                if "--build" in command:
+                    directory = Path(command[command.index("--build") + 1])
+                    (directory / "libqsfa_q8c4_o8.so").write_bytes(b"unresolved-symbol-fixture")
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                patch.object(build.subprocess, "run", side_effect=fake_cmake),
+                patch.object(sys.modules["torch"].ops, "load_library", side_effect=OSError("undefined symbol")),
+                self.assertRaisesRegex(OSError, "undefined symbol"),
+            ):
+                build.build_library()
+            self.assertFalse(list(project.rglob("manifest.json")))
+
+    def test_load_validation_does_not_execute_the_operator(self):
+        calls = []
+
+        def compute(*args):
+            self.fail("Build validation must not dispatch compute")
+
+        torch = types.SimpleNamespace(
+            ops=types.SimpleNamespace(load_library=calls.append, qsfa_q8c4_o8=types.SimpleNamespace(forward=compute))
+        )
+        build._verify_library_load(torch, self.root / "example.so")
+        self.assertEqual(calls, [str(self.root / "example.so")])
 
 
 if __name__ == "__main__":

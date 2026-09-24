@@ -94,6 +94,13 @@ def _toolchain_options(config, compiler):
     return [f"-DASC_DIR={config.parent}", *options]
 
 
+def _verify_library_load(torch, library):
+    """Resolve host symbols/register schemas only; never dispatch a kernel."""
+    print("Checking QSFA shared-library load and registration (no NPU execution)", flush=True)
+    torch.ops.load_library(str(library))
+    _ = torch.ops.qsfa_q8c4_o8.forward
+
+
 def build_library(jobs=4, *, _remaining_compilers=None):
     """Return a JSON-safe library manifest after an offline build or cache hit."""
     if platform.system() != "Linux":
@@ -114,7 +121,6 @@ def build_library(jobs=4, *, _remaining_compilers=None):
     print(f"CANN build route: {route}; root: {cann}; compiler: {compiler}; ASC package: {asc_config}", flush=True)
     npu_root = Path(torch_npu.__file__).resolve().parent
     required = [
-        "torch_npu/csrc/core/NPUBridge.h",
         "torch_npu/csrc/core/npu/NPUStream.h",
         "torch_npu/csrc/core/npu/NPUGuard.h",
         "torch_npu/csrc/core/npu/NPUCachingAllocator.h",
@@ -176,6 +182,7 @@ def build_library(jobs=4, *, _remaining_compilers=None):
             old.get("fingerprint") == fingerprint
             and old.get("library_sha256") == hashlib.sha256(library.read_bytes()).hexdigest()
         ):
+            _verify_library_load(torch, library)
             print(f"Reusing standalone QSFA library: {library}", flush=True)
             return {**old, "reused": True}
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -206,11 +213,13 @@ def build_library(jobs=4, *, _remaining_compilers=None):
     subprocess.run([cmake, "--build", str(build_dir), "--parallel", str(jobs)], check=True)
     if not library.is_file():
         raise RuntimeError(f"Build returned success but library is absent: {library}")
+    _verify_library_load(torch, library)
     result = {
         "library": str(library),
         "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
         "fingerprint": fingerprint,
         "reused": False,
+        "load_verified": True,
         "environment": identity,
     }
     stamp.write_text(json.dumps(result, indent=2) + "\n")

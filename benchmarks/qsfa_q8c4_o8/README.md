@@ -1,6 +1,6 @@
 # A5 Q8/C4/O8 QSFA 算子原型
 
-这是 **Ascend C 设备代码**，通过独立 Torch `.so` 执行。当前是五个串行 kernel 的研究原型，尚未在 A5 编译、验证或测得加速，不是已完成优化的融合 QSFA。只做单算子；没有修改 VA/AV、模型或现有 CANN OPP。
+这是 **Ascend C 设备代码**，通过独立 Torch `.so` 执行。当前是五个串行 kernel 的研究原型，已在用户的 A5/CANN9.1.1 容器完成编译、链接，设备精度与性能尚未验证，不是已完成优化的融合 QSFA。只做单算子；没有修改 VA/AV、模型或现有 CANN OPP。
 
 ## 在现有 A5 容器中执行
 
@@ -15,6 +15,8 @@ git -C /workspace/vllm-ascend-glm-mxfp4 pull --ff-only && bash /workspace/vllm-a
 构建支持已安装的 `ASCConfig.cmake` / `FindASC.cmake`，也支持缺少该 CMake 包但有原生 `bisheng` 的容器。后者自动使用同一 CANN 目录内的编译器、头文件和库；先编译、链接一个包含 Cube、SIMT VF 和 host launch 的最小样例，**不执行设备代码**，再编译实际算子。只存在旧 `ascendc.cmake` 不证明原生 `.asc` 语法可用，须由这个编译检查确认；失败的编译器输出保存在 `.build/<摘要>/toolchain_probe.log`。同一 CANN 内若有多个不同的 `bisheng`，检查失败后尝试下一个；实际算子编译失败则直接停止。不会跨 CANN 版本混用工具链或安装 SDK。
 
 这两份源码使用 SIMD/Cube 和 SIMD 内调用 SIMT VF，构建不使用纯 SIMT 的 `--enable-simt`。参见[官方原生编译说明](https://asc.gitcode.com/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.html)。最小样例通过仅证明基本编译、链接路径；实际 MXFP8 API 兼容性仍由后续算子编译检查，精度与性能仍须 A5 实测。
+
+构建后还会用当前 Python/torch_npu 加载 `.so` 并检查算子注册，成功后才写入构建 manifest；这一检查不调用设备 kernel。加载成功也不等于精度通过。
 
 默认：**Q=1、H=8、K=8192、selected=2048、D=576（NoPE512+RoPE64）**，seed=20260921。H 是单卡本地 head 数。当前仅支持单序列、单 KV head、decode，H∈{8,16,32,64}，selected∈[128,8192] 且为128的倍数。K 可以更长；selected 是实际参与 attention 的稀疏 token 数。
 
@@ -82,4 +84,8 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 2026-09-24 构建入口修复：相关5个测试文件共43项及31个子测试通过，新增多工具链目录、符号链接环、编译检查失败后回退与实际内核编译失败即停止的本地回归；构建命令用 mock 验证流程。Ruff、shell语法检查通过；本机没有 CANN 编译器/A5，尚不能宣称实际 CANN 编译通过。仓库完整格式检查仍因缺少 pre-commit 未执行。
 
-**待 A5 验证**：CANN9.1实际编译兼容、MX NoPE→BF16 RoPE连续累加、完整数值结果、设备任务和 wall 性能。尚未支持 torch.compile/ACLGraph、prefill、多batch、框架接入或端到端模型验证。包含 CANN 派生代码的 `csrc/matmul.asc` 保留 CANN2.0许可，见 `CANN_LICENSE`。
+2026-09-24 用户 A5 日志确认：CANN9.1.1 的原生 bisheng 完成 `.so` 编译、链接；随后 `torch.ops.load_library` 报 `NPUBridge::GetNpuStorageImplDesc` 未定义符号，未进入 NPU 计算。布局检查已改为通过 dispatcher 调用 [torch_npu v2.10.0 注册的 `npu::get_npu_format(Tensor) -> int`](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/aten/npu_native_functions.yaml)，保留严格 ND 检查，避免依赖没有导出标注的 NPUBridge 内部接口；同时让未解析的外部符号在链接阶段报错。
+
+加载修复本地验证：49项及31个子测试通过，包含实际编译、链接、运行 CPU libtorch 的 C++ Dispatcher 测试（ND接受、NZ拒绝、int64返回值、schema缺失及随后注册），以及加载失败时不生成成功 manifest 的回归。该测试没有 torch_npu/A5，不代表设备验证。
+
+**待 A5 验证**：本次加载修复、MX NoPE→BF16 RoPE连续累加、完整数值结果、设备任务和 wall 性能。尚未支持 torch.compile/ACLGraph、prefill、多batch、框架接入或端到端模型验证。包含 CANN 派生代码的 `csrc/matmul.asc` 保留 CANN2.0许可，见 `CANN_LICENSE`。

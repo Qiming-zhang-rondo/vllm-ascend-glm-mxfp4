@@ -79,5 +79,6 @@ target_compile_options(qsfa_q8c4_o8 PRIVATE ${TORCH_ABI_FLAGS}
     $<$<COMPILE_LANGUAGE:ASC>:-O2>)
 target_link_libraries(qsfa_q8c4_o8 PRIVATE ${TORCH_LIBRARIES} "${TORCH_NPU_LIBRARY}"
     "${ASCENDCL_LIBRARY}" "${ASCENDC_RUNTIME_LIBRARY}" dl)
+target_link_options(qsfa_q8c4_o8 PRIVATE -Wl,--no-undefined)
 set_target_properties(qsfa_q8c4_o8 PROPERTIES BUILD_RPATH
     "${TORCH_NPU_ROOT}/lib;${TORCH_INSTALL_PREFIX}/lib;${CANN_LIBRARY_DIRS}")

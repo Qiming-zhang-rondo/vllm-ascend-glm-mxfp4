@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Standalone eager prototype. No VA registration or global operator replacement.
 #include "launch.h"
+#include "storage_format.h"
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -10,7 +11,6 @@
 #include <limits>
 #include <tuple>
 
-#include "torch_npu/csrc/core/NPUBridge.h"
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
@@ -52,8 +52,7 @@ void check_contract(const at::Tensor& q, const at::Tensor& qs,
 void require_nd(const at::Tensor& tensor)
 {
     TORCH_CHECK(tensor.is_privateuseone(), "all runtime inputs and allocations must be on NPU");
-    const auto format = torch_npu::NPUBridge::GetNpuStorageImplDesc(tensor).npu_format_;
-    TORCH_CHECK(format == ACL_FORMAT_ND, "raw kernel input/storage must be ND; cast to format 2 before calling");
+    qsfa_storage::require_nd_format(tensor);
 }
 
 Result meta(const at::Tensor& q, const at::Tensor& qs, const at::Tensor& kv,
