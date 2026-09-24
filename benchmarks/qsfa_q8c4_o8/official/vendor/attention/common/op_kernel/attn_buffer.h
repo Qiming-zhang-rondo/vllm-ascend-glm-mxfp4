@@ -124,7 +124,13 @@ struct BufferInfo {
         } else if constexpr (Type == BufferType::L0B) {
             return PIPE_M;
         } else if constexpr (Type == BufferType::L0C) {
+#if defined(__ASC_NPU_HOST__)
+            // Native ASC parses constexpr bodies in the host pass, where
+            // PIPE_FIX is unavailable. This value is never used on device.
+            return PIPE_M;
+#else
             return PIPE_FIX;
+#endif
         }
     }
 

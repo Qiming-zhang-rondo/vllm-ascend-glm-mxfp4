@@ -35,6 +35,7 @@ class OfficialSourceBuildTests(unittest.TestCase):
         manifest = json.loads((OFFICIAL / "UPSTREAM.json").read_text())
         self.assertEqual(manifest["ref"], "55498d91634277d4eec912499c027818a8c167fb")
         modified = {
+            "attention/common/op_kernel/attn_buffer.h",
             ARCH + "kv_quant_sparse_flash_attention_common_arch35.h",
             ARCH + "kv_quant_sparse_flash_attention_kernel_mla_arch35.h",
             ARCH + "kv_quant_sparse_flash_attention_service_cube_mla_arch35.h",
@@ -121,6 +122,55 @@ class OfficialSourceBuildTests(unittest.TestCase):
                 self.assertIsNotNone(resolved, f"Missing include {include!r} from {path}")
                 pending.append(resolved)
         self.assertGreaterEqual(len(seen), 35)
+
+    def test_buffer_info_host_parse_without_fix_pipe_preserves_device_fix(self):
+        compiler = shutil.which("c++")
+        if compiler is None:
+            self.skipTest("C++ compiler unavailable")
+        header = (OFFICIAL / "vendor/attention/common/op_kernel/attn_buffer.h").read_text()
+        # Compile the actual enum/BufferInfo definitions, without the unrelated
+        # tensor/synchronization methods that need a complete CANN compiler.
+        declarations = header[header.index("enum class BufferType {") : header.index("// buffer绑定生产者")]
+        stub = """
+#include <cstdint>
+#define __aicore__
+enum pipe_t { PIPE_M, PIPE_MTE1, PIPE_MTE2
+#ifndef __ASC_NPU_HOST__
+    , PIPE_FIX
+#endif
+};
+enum class HardEvent {
+    MTE2_MTE1, MTE1_M, M_FIX, MTE2_S, MTE1_MTE2, M_MTE1, FIX_M, S_MTE2
+};
+enum class TPosition { A1, A2, B2, CO1, VECIN, GM, C2 };
+"""
+        assertions = """
+static_assert(BufferInfo<BufferType::L1>::ConsPipe == PIPE_MTE1);
+static_assert(BufferInfo<BufferType::L0A>::ConsPipe == PIPE_M);
+static_assert(BufferInfo<BufferType::L0B>::ConsPipe == PIPE_M);
+#ifdef __ASC_NPU_HOST__
+static_assert(BufferInfo<BufferType::L0C>::ConsPipe == PIPE_M);
+#else
+static_assert(BufferInfo<BufferType::L0C>::ConsPipe == PIPE_FIX);
+#endif
+static_assert(BufferInfo<BufferType::L0C>::EventP2C == HardEvent::M_FIX);
+static_assert(BufferInfo<BufferType::L0C>::EventC2P == HardEvent::FIX_M);
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "buffer_info.cpp"
+            source.write_text(stub + declarations + assertions)
+            for defines in (
+                ["-D__ASC_NPU_HOST__=1"],
+                ["-D__NPU_ARCH__=3510", "-D__DAV_C310_CUBE__=1"],
+                ["-D__NPU_ARCH__=3510", "-D__DAV_C310_VEC__=1"],
+            ):
+                with self.subTest(defines=defines):
+                    result = subprocess.run(
+                        [compiler, "-std=c++17", "-fsyntax-only", *defines, str(source)],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_qsfa_schema_coexists_with_sdk_tiling_in_both_include_orders(self):
         # ASC can prepend a generated/SDK directory to user include paths.

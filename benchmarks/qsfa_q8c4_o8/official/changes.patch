@@ -1,3 +1,19 @@
+--- a/attention/common/op_kernel/attn_buffer.h
++++ b/attention/common/op_kernel/attn_buffer.h
+@@ -124,7 +124,13 @@
+         } else if constexpr (Type == BufferType::L0B) {
+             return PIPE_M;
+         } else if constexpr (Type == BufferType::L0C) {
++#if defined(__ASC_NPU_HOST__)
++            // Native ASC parses constexpr bodies in the host pass, where
++            // PIPE_FIX is unavailable. This value is never used on device.
++            return PIPE_M;
++#else
+             return PIPE_FIX;
++#endif
+         }
+     }
+
 --- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_common_arch35.h
 +++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_common_arch35.h
 @@ -15,7 +15,8 @@

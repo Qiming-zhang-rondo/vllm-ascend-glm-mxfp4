@@ -94,3 +94,10 @@ CANN's generic `kernel_tiling/kernel_tiling.h` path: ASC may prioritize its
 generated/SDK tiling directory, and SDK matmul code needs its own types from
 that header. QSFA's schema and the SDK header now coexist instead of relying
 on include search order. The schema's fields and compute logic are unchanged.
+
+The native ASC host pass also parses `BufferInfo::GetConsPipe()` because it
+is `constexpr`, but does not expose the device-only `PIPE_FIX` enumerator.
+The vendored `attn_buffer.h` uses an unused `PIPE_M` placeholder only under
+`__ASC_NPU_HOST__`. Device compilation keeps `PIPE_FIX` and the original
+FIX event/cross-core synchronization. Host launch arguments use ordinary
+byte pointers; the kernel parameters retain their `GM_ADDR` qualifiers.

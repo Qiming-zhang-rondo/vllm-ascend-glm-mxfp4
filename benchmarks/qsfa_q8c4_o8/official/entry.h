@@ -65,7 +65,9 @@ extern "C" void QSFA_OFFICIAL_LAUNCH(
     constexpr uint32_t ubBytes = qsfa_official_contract::CONTROL_DYNAMIC_UB_BYTES;
 #endif
     QSFA_OFFICIAL_KERNEL<<<1, ubBytes, stream>>>(
-        (GM_ADDR)query, (GM_ADDR)cache, (GM_ADDR)indices, (GM_ADDR)blockTable,
-        (GM_ADDR)cuQ, (GM_ADDR)kvLen, (GM_ADDR)output, (GM_ADDR)workspace,
+        static_cast<uint8_t*>(query), static_cast<uint8_t*>(cache),
+        static_cast<uint8_t*>(indices), static_cast<uint8_t*>(blockTable),
+        static_cast<uint8_t*>(cuQ), static_cast<uint8_t*>(kvLen),
+        static_cast<uint8_t*>(output), static_cast<uint8_t*>(workspace),
         heads, cacheRows, selected, softmaxScale);
 }
