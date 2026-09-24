@@ -1,12 +1,22 @@
 # A5 QSFA：官方流水与 Q8/C4/O8 原型的性能差距
 
-2026-09-24。结论：有明确的结构性优化空间，首要目标是复用官方按 tile 的 Cube/Vector 流水和片上缓存，而不是继续只调整 dtype 或增加 launch 核数。本文件是源码分析和下一版设计依据，尚未实现融合版本，也没有新的 A5 性能结果。
+2026-09-24。结论：后续改造直接基于官方 QSFA 源码，保留按 tile 的 Cube/Vector 流水和片上缓存。本文件记录源码依据、原型实测与选定路线。现有五阶段和三阶段原型均已有默认用例的 A5 结果；基于官方源码的 Q8/C4/O8 融合版本尚未实现。
+
+## 已选定的开发路线
+
+用户确认采用**官方 QSFA 源码增量改造**，不再把自写三阶段原型作为主要性能优化路线。现有 `prototype` / `tiled` 保留为数值回归参照，不能称作官方融合 QSFA 的低精度版本。
+
+实现基线固定为下文的 `cann/ops-transformer@55498d916342`，保留官方 `KvQuantSparseFlashAttentionMla::ProcessMainLoop`、在线 softmax、KV/P 三槽复用和跨核握手。修改边界是 Vector 侧 C4 cache 解码/布局、Cube 侧 Q8 QK 输入/scale，以及最终归一化后的 O8 输出。不能只把全局 `Q_T` 替换为 FP8；详见后文的类型和 L1 约束。
+
+构建产物仍采用独立测试库，与容器原生 QSFA 并排运行。**独立编译不等于重新实现流水**：官方来源、固定 ref 与补丁必须可核查。验证顺序为同份官方源码不改数值路径的编译对照 → 增量 Q8/C4/O8 改造；同时保留已安装 CANN 原生调用作为外部基线。公开源码与容器二进制版本、raw launch 与 torch_npu 的调度差异需要单独识别，不能归因于量化本身。
+
+2026-09-24 UB 预留修复后的用户反馈：同一冻结输入 SHA256 `582409c4822dc41baea76f2ed9b630d51b4df58ee9dfebc692a8a37e14769dad`，`tiled` 完成运行，decoded-payload 误差0；p50=0.334428ms，同期原生p50=0.132274ms。相对前次五阶段原型0.452614ms，调用延迟减少26.1%；相对同期原生仍为2.5283倍。这里是同步wall耗时，不是设备kernel耗时。对原始BF16的relative RMSE仍为0.115499，整体量化筛选失败；对C4/BF16的新增relative RMSE=0.042727，增量筛选通过。官方流水改造不会自动消除这项量化误差。
 
 ## 实测基线与证据范围
 
 用户在 Ascend950DT_9582、CANN9.1.1、torch2.10/torch_npu2.10 环境运行同一份输入的两个独立进程：Q=1、H=8、KV=8192、selected=2048、D=576（NoPE512/RoPE64），warmup5/iters20。
 
-| 指标 | 已安装原生 QSFA | 当前 Q8/C4/O8 原型 |
+| 指标 | 已安装原生 QSFA（首轮） | 五阶段 Q8/C4/O8 原型（首轮） |
 |---|---:|---:|
 | 同步 wall p50 | 0.131050ms | 0.452614ms |
 | 同步 wall mean | 0.129601ms | 0.450560ms |
@@ -99,7 +109,7 @@
 
 按skill的四步分析：Step1已经对照shape、tiling和buffer预算；Step2为卡间通信，本单卡算子不适用；Step3从官方cross-core握手源码完成结构审查，但无时间线；Step4目前只有源码候选开销，没有设备流水profiling，因此不标注已确认的memory-bound/Cube-bound/Vector-bound。
 
-下一步先用现有 `run_qsfa.sh --profile` 保留同环境的两组trace：查看候选5个kernel的Task Duration、调用之间的主机空隙、原生kernel组成；需要进一步硬件计数器才能判断真实访存瓶颈。raw launch与torch_npu调度在blocking环境下的行为也应从timeline核对，不能仅由环境变量名推断每次launch是否阻塞。
+可用现有 `run_qsfa.sh --profile` 保留同环境的两组trace：当前默认tiled为3个kernel，prototype为5个kernel，查看其Task Duration、调用之间的主机空隙和原生kernel组成；需要进一步硬件计数器才能判断真实访存瓶颈。raw launch与torch_npu调度在blocking环境下的行为也应从timeline核对，不能仅由环境变量名推断每次launch是否阻塞。此采集不改变已选定的官方源码改造路线。
 
 融合版应依次验证解码/布局、QK与FP32累加、在线softmax/PV、最终O8；继续用同一冻结输入、官方golden和容器原生FP8 QSFA作对照。只有完整计算正确性通过后才报告wall加速比，并另列设备任务时间。首先复测已通过的默认shape，再覆盖H16/32/64、不同selected长度和真实dump输入；未验证的shape直接拒绝而非静默切路径。
 
