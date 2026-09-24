@@ -12,6 +12,10 @@ git -C /workspace/vllm-ascend-glm-mxfp4 pull --ff-only && bash /workspace/vllm-a
 
 脚本会编译局部 `.so`，然后做精度检查，通过计算正确性门槛后再计时。复用容器的 Python、torch、torch_npu、CANN、CMake 和 C++ 编译器；缺依赖直接说明，不下载、不 pip install、不重编 VA。源码、编译环境和产物摘要匹配时复用已有 `.so`。
 
+构建支持已安装的 `ASCConfig.cmake` / `FindASC.cmake`，也支持缺少该 CMake 包但有原生 `bisheng` 的容器。后者自动使用同一 CANN 目录内的编译器、头文件和库；先编译、链接一个包含 Cube、SIMT VF 和 host launch 的最小样例，**不执行设备代码**，再编译实际算子。只存在旧 `ascendc.cmake` 不证明原生 `.asc` 语法可用，须由这个编译检查确认；失败的编译器输出保存在 `.build/<摘要>/toolchain_probe.log`。同一 CANN 内若有多个不同的 `bisheng`，检查失败后尝试下一个；实际算子编译失败则直接停止。不会跨 CANN 版本混用工具链或安装 SDK。
+
+这两份源码使用 SIMD/Cube 和 SIMD 内调用 SIMT VF，构建不使用纯 SIMT 的 `--enable-simt`。参见[官方原生编译说明](https://asc.gitcode.com/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.html)。最小样例通过仅证明基本编译、链接路径；实际 MXFP8 API 兼容性仍由后续算子编译检查，精度与性能仍须 A5 实测。
+
 默认：**Q=1、H=8、K=8192、selected=2048、D=576（NoPE512+RoPE64）**，seed=20260921。H 是单卡本地 head 数。当前仅支持单序列、单 KV head、decode，H∈{8,16,32,64}，selected∈[128,8192] 且为128的倍数。K 可以更长；selected 是实际参与 attention 的稀疏 token 数。
 
 可选参数：`--build-only`、`--jobs 4`、`--python /path/to/python`、`--profile`、`--heads 16`、`--key-tokens 57344`、`--selected-tokens 2048`。`--profile` 额外采一轮完整算子的 CPU/NPU trace。这里不运行此前超时的原生 INT8 QSFA baseline。
@@ -66,7 +70,7 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 ## 源码依据和验证边界
 
-- CANN skill：`cann/cannbot-skills@3074681ba927916f99f5a9ac808b4e6797934ce5` 的 `ascendc-direct-invoke-template`、`torch-ascendc-op-extension/routes/direct-invoke.md`、`ascendc-simt-best-practices`。采用 ASC CMake+直接 launch；没有自制 ACL ctypes binding。
+- CANN skill：`cann/cannbot-skills@3074681ba927916f99f5a9ac808b4e6797934ce5` 的 `ascendc-direct-invoke-template`、`torch-ascendc-op-extension/routes/direct-invoke.md`、`ascendc-simt-best-practices`。采用 ASC CMake 或原生 bisheng 编译，加直接 launch；没有自制 ACL ctypes binding。
 - [QLI V2 Cube reference](https://gitcode.com/cann/ops-transformer/blob/55498d91634277d4eec912499c027818a8c167fb/attention/quant_lightning_indexer_v2/op_kernel/arch35/quant_lightning_indexer_v2_service_cube_arch35.h)：`LoadQScaleToL1`、`LoadKScaleToL1`、`LoadQueryToL0a`、`LoadKeyToL0b`、`ComputeL0c` 提供 MX L0 类型、scale pair 的 Dn2Nz 和 NT LoadData 合同。
 - [QSFA 官方 golden](https://gitcode.com/cann/ops-transformer/blob/55498d91634277d4eec912499c027818a8c167fb/attention/kv_quant_sparse_flash_attention/tests/pytest/kv_quant_sparse_flash_attention_golden.py)：复用此前固定的 `gatherKV/softmax/_t_increattention_bnsd`，见相邻 `qsfa_fake_quant/vendor/SOURCES.json`。
 - [QuantMatmulWeightNz](https://gitcode.com/cann/ops-nn/blob/2a77283db46e6648ff47bc8277442cf9c721e3c2/matmul/quant_batch_matmul_v3/docs/aclnnQuantMatmulWeightNz.md)：MXFP8×MXFP8、FP32输出合同；同ref依赖的 `ops-tensor@781745c86312b478009742851b6cfc1967da8dda` 中 `KernelMatmulMixWeightPrologue::CopyConvertStoreWeight` 用 `ShiftW4ToW8`，配合 `BlockMmadWeightPrologueMx::CopyCL0c2Gm` 的×64补偿。本原型直接使用真实 E2M1→E4M3 数值映射，不照搬该位移技巧。
@@ -75,5 +79,7 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 本机完成 CPU payload/golden/失败门槛测试、实际 `codec.h` 的宿主 C++ 编译及全部 FP8码/舍入边界检查、支持shape的分块地址核对、源代码同步检查。同步脚本最初无法解析泛型 `HardEvent event`，报两条未知方向候选；改为六个显式 Set/Wait 方向函数后候选为0。flow分析仅覆盖两处 DataCopy，跨函数的 Mmad/LoadData/Fixpipe 生命周期另行人工核对，静态检查不证明设备执行正确。
 
 2026-09-23 本地验证：相关4个测试文件共32项及23个子测试通过，Ruff check/format、`bash -n`通过。完整仓库 `bash format.sh ci` 因本地未安装 pre-commit 而未执行，不额外安装依赖。
+
+2026-09-24 构建入口修复：相关5个测试文件共43项及31个子测试通过，新增多工具链目录、符号链接环、编译检查失败后回退与实际内核编译失败即停止的本地回归；构建命令用 mock 验证流程。Ruff、shell语法检查通过；本机没有 CANN 编译器/A5，尚不能宣称实际 CANN 编译通过。仓库完整格式检查仍因缺少 pre-commit 未执行。
 
 **待 A5 验证**：CANN9.1实际编译兼容、MX NoPE→BF16 RoPE连续累加、完整数值结果、设备任务和 wall 性能。尚未支持 torch.compile/ACLGraph、prefill、多batch、框架接入或端到端模型验证。包含 CANN 派生代码的 `csrc/matmul.asc` 保留 CANN2.0许可，见 `CANN_LICENSE`。
