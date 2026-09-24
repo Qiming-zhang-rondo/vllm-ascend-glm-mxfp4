@@ -9,10 +9,12 @@ task_repo=$(cd -- "$task_dir/../.." && pwd)
 task_python=${PYTHON:-python3}
 task_build_only=0
 task_jobs=4
+task_runner=benchmarks.qsfa_q8c4_o8.compare
 task_run_args=()
 while (($#)); do
     case "$1" in
         --build-only) task_build_only=1; shift ;;
+        --candidate-only) task_runner=benchmarks.qsfa_q8c4_o8.run; shift ;;
         --python)
             (($# >= 2)) || { echo '--python requires an executable' >&2; exit 2; }
             task_python=$2; shift 2 ;;
@@ -49,5 +51,5 @@ if ((task_build_only)); then
     echo "Build complete; library: $task_library"
     exit 0
 fi
-"$task_python" -I -c "$task_bootstrap" "$task_repo" benchmarks.qsfa_q8c4_o8.run \
+"$task_python" -I -c "$task_bootstrap" "$task_repo" "$task_runner" \
     --library "$task_library" --output "$task_run_dir/results.json" "${task_run_args[@]}"

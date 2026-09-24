@@ -308,6 +308,91 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(report["compute_verified"])
             self.assertFalse(report["performance"]["measured"])
 
+    def test_native_worker_uses_fp8_cache_and_only_times_validated_output(self):
+        from benchmarks.qsfa_q8c4_o8 import native_baseline
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = run.parse_args(
+                [
+                    "--library",
+                    "unused.so",
+                    "--variant",
+                    "native",
+                    "--output",
+                    str(Path(directory) / "native.json"),
+                    "--key-tokens",
+                    "256",
+                    "--selected-tokens",
+                    "128",
+                    "--warmup",
+                    "1",
+                    "--iters",
+                    "2",
+                    "--threads",
+                    "2",
+                ]
+            )
+            query, kv, indices, scale = run.load_inputs(args)
+            _, decoded_kv, _ = native_baseline.prepare_inputs(query, kv, indices, scale)
+            expected = run.attention_reference(query, decoded_kv, indices, scale).bfloat16()
+            calls = []
+
+            def fake_native(**kwargs):
+                self.assertIs(kwargs["key"], kwargs["value"])
+                self.assertEqual(kwargs["key"].dtype, torch.float8_e4m3fn)
+                self.assertEqual(kwargs["query"].dtype, torch.bfloat16)
+                self.assertEqual(kwargs["layout_query"], "TND")
+                calls.append(True)
+                return expected
+
+            runtime = fake_native, torch.device("cpu"), lambda: None, {"cpu_mock": True}
+            with (
+                patch.object(run, "load_runtime", return_value=runtime) as loader,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(run.run(args), 0)
+            loader.assert_called_once_with(args.library, args.device, native=True)
+            report = json.loads(args.output.read_text())
+            self.assertTrue(report["compute_verified"])
+            self.assertTrue(report["performance"]["measured"])
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(len(report["performance"]["samples_ms"]), 2)
+            self.assertGreater(report["accuracy"]["native_elementwise_check"]["cosine"], 0.999)
+
+    def test_native_zero_or_malformed_output_cannot_produce_a_performance_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = run.parse_args(
+                [
+                    "--library",
+                    "unused.so",
+                    "--variant",
+                    "native",
+                    "--output",
+                    str(Path(directory) / "native.json"),
+                    "--key-tokens",
+                    "256",
+                    "--selected-tokens",
+                    "128",
+                    "--threads",
+                    "2",
+                ]
+            )
+            for output in (torch.zeros(1, 8, 512, dtype=torch.bfloat16), torch.zeros(1, 8, 512), (torch.ones(1),)):
+                runtime = lambda value=output, **_: value, torch.device("cpu"), lambda: None, {"cpu_mock": True}
+                with (
+                    self.subTest(type=str(type(output))),
+                    patch.object(run, "load_runtime", return_value=runtime),
+                    patch.object(run, "benchmark") as timing,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(run.run(args), 1)
+                    timing.assert_not_called()
+                    report = json.loads(args.output.read_text())
+                    self.assertEqual(report["status"], "failed")
+                    self.assertFalse(report["compute_verified"])
+                    self.assertFalse(report["performance"]["measured"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Run the actual A5 Q8/C4/O8 custom operator, with CPU input preparation.
+"""Run one A5 attention variant in a fresh process, with CPU input preparation.
 
-No native INT8 baseline, dependency installation or fallback is performed.
-Wall latency covers the full custom op and synchronization, not isolated Cube
-instructions. The optional profiler provides device tasks for separate review.
+The comparison launcher runs this worker separately for the custom Q8/C4/O8
+operator and the installed native BF16 Q/O, FP8-cache QSFA. Wall latency covers
+the full call and synchronization, not isolated Cube instructions.
 """
 
 import argparse
@@ -23,6 +23,7 @@ if __package__ in (None, ""):
 
 import torch  # noqa: E402
 
+from benchmarks.qsfa_fake_quant.official_baseline import validate_native_output  # noqa: E402
 from benchmarks.qsfa_fake_quant.quantization import mxfp8_roundtrip  # noqa: E402
 from benchmarks.qsfa_fake_quant.reference import attention_reference, error_metrics, synthetic_inputs  # noqa: E402
 from benchmarks.qsfa_q8c4_o8.packing import (  # noqa: E402
@@ -43,6 +44,7 @@ ARGUMENT_ORDER = ("q", "qs", "kv", "ks", "rope", "idx")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--variant", choices=("candidate", "native"), default="candidate")
     parser.add_argument("--library", type=Path, required=True, help="Built custom torch operator shared library")
     parser.add_argument("--output", type=Path, default=Path("qsfa_q8c4_o8_results.json"))
     parser.add_argument("--heads", type=int, choices=SUPPORTED_HEADS, default=8)
@@ -96,8 +98,8 @@ def reference_outputs(decoded_query, decoded_kv, original_query, original_kv, in
     return decoded_golden, original_golden
 
 
-def load_runtime(library, device_index):
-    if not library.is_file():
+def load_runtime(library, device_index, *, native=False):
+    if not native and not library.is_file():
         raise FileNotFoundError(f"Custom operator library does not exist: {library}")
     import torch_npu
 
@@ -105,8 +107,13 @@ def load_runtime(library, device_index):
         raise RuntimeError("No NPU is available; the runner does not install dependencies or use a CPU fallback")
     torch.npu.set_device(device_index)
     device = torch.device(f"npu:{device_index}")
-    torch.ops.load_library(str(library.resolve()))
-    operation = torch.ops.qsfa_q8c4_o8.forward
+    if native:
+        from benchmarks.qsfa_q8c4_o8.native_baseline import load_operation
+
+        operation = load_operation()
+    else:
+        torch.ops.load_library(str(library.resolve()))
+        operation = torch.ops.qsfa_q8c4_o8.forward
     return (
         operation,
         device,
@@ -114,9 +121,11 @@ def load_runtime(library, device_index):
         {
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
+            "torch_npu_path": str(Path(torch_npu.__file__).resolve()),
             "device": str(device),
             "device_name": torch.npu.get_device_name(device_index),
-            "library": str(library.resolve()),
+            "library": None if native else str(library.resolve()),
+            "api": "torch_npu.npu_kv_quant_sparse_flash_attention" if native else "torch.ops.qsfa_q8c4_o8.forward",
         },
     )
 
@@ -164,11 +173,11 @@ def compare_output(actual, decoded_golden, original_golden, c4_bf16_golden=None)
     return result
 
 
-def benchmark(invoke, synchronize, warmup, iterations):
+def benchmark(invoke, synchronize, warmup, iterations, *, validate_result=check_status, native=False):
     for _ in range(warmup):
         result = invoke()
         synchronize()
-        check_status(result)
+        validate_result(result)
     samples = []
     for _ in range(iterations):
         synchronize()
@@ -176,11 +185,15 @@ def benchmark(invoke, synchronize, warmup, iterations):
         result = invoke()
         synchronize()
         samples.append((time.perf_counter() - start) * 1000.0)
-        check_status(result)  # Status readback is outside the measured interval.
+        validate_result(result)  # Validation/readback is outside the measured interval.
     ordered = sorted(samples)
     return {
-        "scope": "Synchronous custom-op wall time: host dispatch/allocations, all device kernels and completion sync",
-        "included": "Cache gather/unpack, QK NoPE and RoPE, softmax, BF16 PV, and O8 quantization/writeout",
+        "scope": "Synchronous operator wall time: host dispatch/allocations, all device kernels and completion sync",
+        "included": (
+            "Full native QSFA: sparse PA cache access/dequantization, attention and BF16 output"
+            if native
+            else "Cache gather/unpack, QK NoPE and RoPE, softmax, BF16 PV, and O8 quantization/writeout"
+        ),
         "excluded": "CPU source generation/packing/reference, H2D, library loading/JIT, warmup and result readback",
         "not_kernel_task_duration": True,
         "warmup": warmup,
@@ -194,7 +207,7 @@ def benchmark(invoke, synchronize, warmup, iterations):
     }
 
 
-def capture_profile(invoke, synchronize, output_path):
+def capture_profile(invoke, synchronize, output_path, *, validate_result=check_status):
     import torch_npu
 
     profiler = torch_npu.profiler
@@ -210,20 +223,22 @@ def capture_profile(invoke, synchronize, output_path):
     ):
         result = invoke()
         synchronize()
-    check_status(result)
+    validate_result(result)
     return {
         "directory": str(trace_dir.resolve()),
-        "scope": "One extra full custom-op invocation; inspect all its device tasks, not only QK",
+        "scope": "One extra full operator invocation; inspect all its device tasks, not only QK",
         "device_task_duration_automatically_summarized": False,
     }
 
 
 @torch.inference_mode()
 def run(args):
+    if args.variant == "native":
+        return run_native(args)
     report = {
         "status": "running",
         "stage": "initialization",
-        "scope": "Actual custom A5 Q8/C4/O8 prototype; one Q token; no model or native INT8 baseline",
+        "scope": "Actual custom A5 Q8/C4/O8 prototype; one Q token; native baseline runs in a separate process",
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "compute_verified": False,
         "performance": {"measured": False},
@@ -294,6 +309,105 @@ def run(args):
             stage(args, report, "Explicit profiler capture of one complete candidate invocation")
             report["profile"] = capture_profile(invoke, synchronize, args.output)
         report["status"] = "passed" if accuracy["quantization_screening_passed"] else "quantization_failed"
+        report["stage"] = "complete"
+        write_report(args.output, report)
+        return 0 if report["status"] == "passed" else 1
+    except Exception as exc:
+        report["status"] = "failed"
+        report["error"] = {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
+        write_report(args.output, report)
+        traceback.print_exc()
+        return 1
+
+
+@torch.inference_mode()
+def run_native(args):
+    """Measure the installed public QSFA using its actual FP8 PA cache contract."""
+    from benchmarks.qsfa_q8c4_o8.native_baseline import prepare_inputs as prepare_native_inputs
+    from benchmarks.qsfa_q8c4_o8.native_baseline import reference_output
+
+    report = {
+        "status": "running",
+        "stage": "initialization",
+        "scope": "Installed native QSFA: BF16 query/output, FP8 E4M3 cache with D128 FP32 scales",
+        "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+        "compute_verified": False,
+        "performance": {"measured": False},
+    }
+    write_report(args.output, report)
+    try:
+        torch.set_num_threads(args.threads)
+        stage(args, report, "Native baseline: CPU FP8 combined-PA inputs and decoded-payload golden")
+        query, kv, indices, scale = load_inputs(args)
+        inputs, decoded_kv, contract = prepare_native_inputs(query, kv, indices, scale)
+        query, kv = query.bfloat16(), kv.bfloat16()
+        report["contract"] = contract
+        report["case"] = {
+            "query_shape": list(query.shape),
+            "kv_shape": list(kv.shape),
+            "indices_shape": list(indices.shape),
+            "scale": scale,
+            "prepared_inputs": {
+                name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+                for name, value in inputs.items()
+                if isinstance(value, torch.Tensor)
+            },
+        }
+        expected = reference_output(query, decoded_kv, indices, scale)
+        original_golden = attention_reference(query, kv, indices, scale).bfloat16().float()
+        stage(args, report, "Native baseline: load existing torch_npu QSFA API")
+        operation, device, synchronize, runtime_info = load_runtime(args.library, args.device, native=True)
+        report["runtime"] = runtime_info
+        stage(args, report, "Native baseline: copy prepared inputs to NPU")
+        # MLA absorb uses key=value. Preserve the alias, including on device.
+        device_inputs = {
+            name: value.to(device) if isinstance(value, torch.Tensor) else value
+            for name, value in inputs.items()
+            if name not in ("key", "value")
+        }
+        # The FP8-typed carrier also contains BF16/FP32 bytes (possibly FP8 NaN
+        # bit patterns). Transfer those bytes without any numerical conversion.
+        cache_bytes = inputs["key"].view(torch.uint8)
+        device_inputs["key"] = cache_bytes.to(device).view(torch.float8_e4m3fn)
+        device_inputs["value"] = device_inputs["key"]
+        synchronize()
+        if not torch.equal(device_inputs["key"].view(torch.uint8).cpu(), cache_bytes):
+            raise AssertionError("Native PA656 cache changed during H2D transfer; QSFA was not called")
+        report["cache_bytes_verified"] = True
+
+        def invoke():
+            return operation(**device_inputs)
+
+        def validate_contract(output):
+            if not isinstance(output, torch.Tensor):
+                raise TypeError("Public torch_npu QSFA must return one Tensor; no tuple/wrapper fallback is used")
+            if output.dtype != torch.bfloat16 or tuple(output.shape) != tuple(expected.shape):
+                raise AssertionError(
+                    f"Expected BF16 native output {tuple(expected.shape)}, got {output.dtype}/{output.shape}"
+                )
+
+        stage(args, report, "Native baseline: first real FP8-cache QSFA invocation and synchronization")
+        result = invoke()
+        synchronize()
+        stage(args, report, "Native baseline: decoded-cache correctness check")
+        validate_contract(result)
+        actual = result.detach().cpu()
+        report["accuracy"] = compare_output(actual.float(), expected, original_golden)
+        report["accuracy"]["native_elementwise_check"] = validate_native_output(actual, expected)
+        if not report["accuracy"]["operator_correctness_passed"]:
+            raise AssertionError("Native QSFA failed decoded-input correctness; timing was not run")
+        report["compute_verified"] = True
+        print("BASELINE_ACCURACY:", json.dumps(report["accuracy"], allow_nan=False), flush=True)
+        stage(args, report, "Native baseline: warmup and full QSFA synchronous wall measurement")
+        report["performance"] = {
+            "measured": True,
+            **benchmark(invoke, synchronize, args.warmup, args.iters, validate_result=validate_contract, native=True),
+        }
+        print("BASELINE_PERFORMANCE:", json.dumps(report["performance"], allow_nan=False), flush=True)
+        if args.profile:
+            stage(args, report, "Native baseline: explicit profiler capture")
+            report["profile"] = capture_profile(invoke, synchronize, args.output, validate_result=validate_contract)
+        report["status"] = "passed" if report["accuracy"]["quantization_screening_passed"] else "quantization_failed"
         report["stage"] = "complete"
         write_report(args.output, report)
         return 0 if report["status"] == "passed" else 1
