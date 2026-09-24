@@ -21,7 +21,7 @@ class OfficialSourceBuildTests(unittest.TestCase):
             OFFICIAL / "vendor/attention/kv_quant_sparse_flash_attention/op_host/"
             "kv_quant_sparse_flash_attention_tiling.h"
         ).read_text()
-        local = (OFFICIAL / "include/kernel_tiling/kernel_tiling.h").read_text()
+        local = (OFFICIAL / "qsfa_tiling_data.h").read_text()
         structs = re.findall(r"BEGIN_TILING_DATA_DEF\((\w+)\)(.*?)END_TILING_DATA_DEF", upstream, re.S)
         self.assertEqual(len(structs), 6)
         for name, body in structs:
@@ -53,7 +53,6 @@ class OfficialSourceBuildTests(unittest.TestCase):
         # the original tree: either the primary or its fallback must resolve.
         roots = [
             OFFICIAL,
-            OFFICIAL / "include",
             OFFICIAL / "vendor/attention/kv_quant_sparse_flash_attention/op_kernel",
             OFFICIAL / "vendor/common/include/op_kernel",
         ]
@@ -78,7 +77,6 @@ class OfficialSourceBuildTests(unittest.TestCase):
     def test_device_header_closure_has_no_unresolved_local_include(self):
         roots = [
             OFFICIAL,
-            OFFICIAL / "include",
             OFFICIAL / "vendor/attention/kv_quant_sparse_flash_attention/op_kernel",
             OFFICIAL / "vendor/common/include/op_kernel",
         ]
@@ -89,6 +87,7 @@ class OfficialSourceBuildTests(unittest.TestCase):
             "kernel_cube_intf.h",
             "kernel_operator.h",
             "kernel_operator_list_tensor_intf.h",
+            "kernel_tiling/kernel_tiling.h",
             "kernel_tensor.h",
             "kernel_vec_intf.h",
             "lib/matmul_intf.h",
@@ -122,6 +121,63 @@ class OfficialSourceBuildTests(unittest.TestCase):
                 self.assertIsNotNone(resolved, f"Missing include {include!r} from {path}")
                 pending.append(resolved)
         self.assertGreaterEqual(len(seen), 35)
+
+    def test_qsfa_schema_coexists_with_sdk_tiling_in_both_include_orders(self):
+        # ASC can prepend a generated/SDK directory to user include paths.
+        # The SDK generic header is valid but does not declare our QSFA types.
+        # Compile the real local schema/MakeTiling with that conflicting name
+        # first AND last; also verify we never shadow SDK TCubeTiling.
+        compiler = shutil.which("c++")
+        if compiler is None:
+            self.skipTest("C++ compiler unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            generic = sdk / "kernel_tiling/kernel_tiling.h"
+            generic.parent.mkdir(parents=True)
+            generic.write_text("#pragma once\nstruct TCubeTiling { unsigned sdk_marker = 73; };\n")
+            for sdk_first in (True, False):
+                for schema_first in (True, False):
+                    with self.subTest(sdk_first=sdk_first, schema_first=schema_first):
+                        headers = ['"kernel_tiling/kernel_tiling.h"', '"tiling.h"']
+                        if schema_first:
+                            headers.reverse()
+                        source = root / "coexist.cpp"
+                        source.write_text(
+                            "\n".join(f"#include {header}" for header in headers)
+                            + "\n#include <type_traits>\n"
+                            + "namespace consumer {\n"
+                            + "const KvQuantSparseFlashAttentionTilingDataMla* current = nullptr;\n"
+                            + "}\n"
+                            + "static_assert(std::is_same_v<decltype(qsfa_official_contract::MakeTiling("
+                            + "8,8192,2048,0.04f,true)), KvQuantSparseFlashAttentionTilingDataMla>);\n"
+                            + "int main() {\n"
+                            + "  TCubeTiling sdk;\n"
+                            + "  const auto local = qsfa_official_contract::MakeTiling(8,8192,2048,0.04f,true);\n"
+                            + "  consumer::current = &local;\n"
+                            + "  return sdk.sdk_marker == 73 &&\n"
+                            + "    consumer::current->baseParams.dSizeVInput == 416 ? 0 : 1;\n"
+                            + "}\n"
+                        )
+                        includes = (sdk, OFFICIAL) if sdk_first else (OFFICIAL, sdk)
+                        binary = root / "coexist"
+                        result = subprocess.run(
+                            [
+                                compiler,
+                                "-std=c++17",
+                                "-Wall",
+                                "-Wextra",
+                                "-Werror",
+                                *(f"-I{path}" for path in includes),
+                                str(source),
+                                "-o",
+                                str(binary),
+                            ],
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
     def test_actual_cpp_tiling_and_shape_contract(self):
         compiler = shutil.which("c++")
@@ -177,7 +233,6 @@ int main() {
                     "-Wextra",
                     "-Werror",
                     f"-I{OFFICIAL}",
-                    f"-I{OFFICIAL / 'include'}",
                     str(src),
                     "-o",
                     str(binary),

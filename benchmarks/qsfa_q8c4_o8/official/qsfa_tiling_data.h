@@ -1,7 +1,9 @@
 // Derived from CANN QSFA tiling schema, copyright Huawei Technologies Co., Ltd.
 // Distributed under the CANN Open Software License Agreement Version 2.0.
-// See ../../vendor/LICENSE and ../../UPSTREAM.json.
+// See vendor/LICENSE and UPSTREAM.json.
 #pragma once
+// Use a QSFA-specific filename. ASC/CANN supplies its own generic
+// kernel_tiling/kernel_tiling.h (including TCubeTiling); do not shadow it.
 #include <cstdint>
 
 // These local C++ structs retain the upstream field names and types. They are

@@ -16,7 +16,7 @@
 #define KV_QUANT_SPARSE_FLASH_ATTENTION_COMMON_ARCH35_H
 #include <type_traits>
 #include "q8c4_layout.h"
-#include "kernel_tiling/kernel_tiling.h"
+#include "qsfa_tiling_data.h"
 
 #if __has_include("../../sparse_flash_attention/arch35/common/util_regbase.h")
 #include "../../sparse_flash_attention/arch35/common/util_regbase.h"

@@ -1,15 +1,26 @@
 --- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_common_arch35.h
 +++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_common_arch35.h
-@@ -15,6 +15,7 @@
+@@ -15,7 +15,8 @@
  #ifndef KV_QUANT_SPARSE_FLASH_ATTENTION_COMMON_ARCH35_H
  #define KV_QUANT_SPARSE_FLASH_ATTENTION_COMMON_ARCH35_H
  #include <type_traits>
+-#include "kernel_tiling/kernel_tiling.h"
 +#include "q8c4_layout.h"
- #include "kernel_tiling/kernel_tiling.h"
++#include "qsfa_tiling_data.h"
 
  #if __has_include("../../sparse_flash_attention/arch35/common/util_regbase.h")
+ #include "../../sparse_flash_attention/arch35/common/util_regbase.h"
 --- a/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_kernel_mla_arch35.h
 +++ b/attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_kernel_mla_arch35.h
+@@ -22,7 +22,7 @@
+ #include "kernel_operator.h"
+ #endif
+ #include "kernel_operator_list_tensor_intf.h"
+-#include "kernel_tiling/kernel_tiling.h"
++#include "qsfa_tiling_data.h"
+ #include "lib/matmul_intf.h"
+ #include "lib/matrix/matmul/tiling.h"
+ #include "kv_quant_sparse_flash_attention_service_cube_mla_arch35.h"
 @@ -177,7 +177,7 @@
      }
 

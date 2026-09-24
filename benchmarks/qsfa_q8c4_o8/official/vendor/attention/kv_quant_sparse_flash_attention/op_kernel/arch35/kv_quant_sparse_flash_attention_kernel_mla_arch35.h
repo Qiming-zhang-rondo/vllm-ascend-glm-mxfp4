@@ -22,7 +22,7 @@
 #include "kernel_operator.h"
 #endif
 #include "kernel_operator_list_tensor_intf.h"
-#include "kernel_tiling/kernel_tiling.h"
+#include "qsfa_tiling_data.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "kv_quant_sparse_flash_attention_service_cube_mla_arch35.h"

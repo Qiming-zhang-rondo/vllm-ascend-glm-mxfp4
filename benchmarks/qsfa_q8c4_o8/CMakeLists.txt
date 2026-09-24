@@ -66,7 +66,6 @@ separate_arguments(TORCH_ABI_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 if(QSFA_BUILD_OFFICIAL)
     list(PREPEND QSFA_CANN_INCLUDES
         "${CMAKE_CURRENT_SOURCE_DIR}/official"
-        "${CMAKE_CURRENT_SOURCE_DIR}/official/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/official/vendor/attention/kv_quant_sparse_flash_attention/op_kernel"
         "${CMAKE_CURRENT_SOURCE_DIR}/official/vendor/common/include/op_kernel")
 endif()

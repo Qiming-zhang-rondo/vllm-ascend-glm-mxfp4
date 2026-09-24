@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "kernel_tiling/kernel_tiling.h"
+#include "qsfa_tiling_data.h"
 
 #ifndef QSFA_TILING_INLINE
 #define QSFA_TILING_INLINE inline

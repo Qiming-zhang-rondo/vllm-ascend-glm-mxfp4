@@ -37,7 +37,7 @@ cache or split-KV reduction in this restricted case.
 
 `entry.h` calls the vendored `KvQuantSparseFlashAttentionMla::Init/Process`
 directly. `tiling.h` constructs the official fields in local kernel memory
-from scalar arguments. `include/kernel_tiling/kernel_tiling.h` retains the
+from scalar arguments. `qsfa_tiling_data.h` retains the
 field names and C++ types from the copied host schema. **These structs are
 not a serialized ACLNN tiling ABI**: no host-generated blob is reinterpreted,
 and `GET_TILING_DATA`/`GetUserWorkspace` are deliberately absent. The AIV
@@ -56,12 +56,11 @@ QSFA `.so`, using the container CANN and existing runtime libraries. Add
 these include roots, relative to this directory:
 
 - `.`
-- `include`
 - `vendor/attention/kv_quant_sparse_flash_attention/op_kernel`
 - `vendor/common/include/op_kernel`
 
-The third path resolves upstream `../../common/op_kernel/...` includes
-without rearranging the vendored source tree. The fourth supplies `util.h`.
+The second path resolves upstream `../../common/op_kernel/...` includes
+without rearranging the vendored source tree. The third supplies `util.h`.
 SDK includes (`kernel_operator.h`, `lib/matmul_intf.h`, etc.) come from the
 installed CANN, not downloaded dependencies.
 
@@ -89,3 +88,9 @@ Local validation on 2026-09-24: host codec, layout, Cube-call contract, libtorch
 Meta/binding and launcher tests pass; CANN compilation and A5 execution pending.
 Ruff and Bash syntax checks pass. Repository `format.sh ci` cannot run because
 pre-commit is absent locally; no dependencies were installed for this check.
+
+The local schema uses the unique header `qsfa_tiling_data.h`. It must not use
+CANN's generic `kernel_tiling/kernel_tiling.h` path: ASC may prioritize its
+generated/SDK tiling directory, and SDK matmul code needs its own types from
+that header. QSFA's schema and the SDK header now coexist instead of relying
+on include search order. The schema's fields and compute logic are unchanged.
