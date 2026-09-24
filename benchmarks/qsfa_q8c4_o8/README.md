@@ -49,6 +49,8 @@ Q 的 D576 全部以 MXFP8 存储；RoPE 部分解码为 BF16 后计算。K/V No
 
 首版显式物化 gather、score、P 和转置 V，使用保守的单缓冲 Cube 搬运和同步。额外 GM 读写、kernel 启动以及小 M 利用率可能抵消低精度 QK 的收益；此版的耗时不能代表将来融合版本的性能上限。
 
+2026-09-24 原生对照已由用户在A5跑通：原型p50=452.614µs，原生FP8-cache QSFA p50=131.050µs；当前原型耗时为原生的3.4538倍，整体量化筛选仍失败。对照官方A5流水、具体优化位置及下一版buffer/精度约束见[源码性能调研](OPTIMIZATION_REVIEW.md)。调研没有改动当前可执行算子。
+
 ## 输入、输出合同
 
 调用 `torch.ops.qsfa_q8c4_o8.forward(q, qs, kv, ks, rope, indices, scale)`，输入均为同一 NPU 的连续 ND tensor，storage offset=0。
