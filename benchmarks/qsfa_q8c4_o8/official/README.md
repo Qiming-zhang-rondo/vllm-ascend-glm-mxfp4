@@ -95,9 +95,16 @@ generated/SDK tiling directory, and SDK matmul code needs its own types from
 that header. QSFA's schema and the SDK header now coexist instead of relying
 on include search order. The schema's fields and compute logic are unchanged.
 
-The native ASC host pass also parses `BufferInfo::GetConsPipe()` because it
-is `constexpr`, but does not expose the device-only `PIPE_FIX` enumerator.
-The vendored `attn_buffer.h` uses an unused `PIPE_M` placeholder only under
-`__ASC_NPU_HOST__`. Device compilation keeps `PIPE_FIX` and the original
-FIX event/cross-core synchronization. Host launch arguments use ordinary
-byte pointers; the kernel parameters retain their `GM_ADDR` qualifiers.
+Native ASC also parses `BufferInfo::GetConsPipe()` in compilation passes that
+do not expose the `PIPE_FIX` enumerator. The vendored `attn_buffer.h` selects
+`PIPE_FIX` only under `__DAV_C310_CUBE__`, matching the official mixed entry's
+Cube guard. Other passes use an unused `PIPE_M` placeholder: only the Cube
+implementation consumes L0C. The original FIX events/cross-core synchronization
+are unchanged. Host launch arguments use ordinary byte pointers; the kernel
+parameters retain their `GM_ADDR` qualifiers.
+
+The initial `__ASC_NPU_HOST__`-only guard was incomplete: CANN also uses
+`__NPU_HOST__` and `__ASCC_HOST__`, and the A5 report still entered its `else`.
+The report alone does not identify that pass as host or AIV. Compile regression
+fixtures now omit `PIPE_FIX` for all non-Cube cases, including a macro-less
+host case; only the Cube fixture supplies it and checks the real FIX selection.

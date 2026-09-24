@@ -123,7 +123,7 @@ class OfficialSourceBuildTests(unittest.TestCase):
                 pending.append(resolved)
         self.assertGreaterEqual(len(seen), 35)
 
-    def test_buffer_info_host_parse_without_fix_pipe_preserves_device_fix(self):
+    def test_buffer_info_only_cube_requires_fix_pipe(self):
         compiler = shutil.which("c++")
         if compiler is None:
             self.skipTest("C++ compiler unavailable")
@@ -135,7 +135,7 @@ class OfficialSourceBuildTests(unittest.TestCase):
 #include <cstdint>
 #define __aicore__
 enum pipe_t { PIPE_M, PIPE_MTE1, PIPE_MTE2
-#ifndef __ASC_NPU_HOST__
+#ifdef TEST_HAS_FIX_PIPE
     , PIPE_FIX
 #endif
 };
@@ -148,10 +148,10 @@ enum class TPosition { A1, A2, B2, CO1, VECIN, GM, C2 };
 static_assert(BufferInfo<BufferType::L1>::ConsPipe == PIPE_MTE1);
 static_assert(BufferInfo<BufferType::L0A>::ConsPipe == PIPE_M);
 static_assert(BufferInfo<BufferType::L0B>::ConsPipe == PIPE_M);
-#ifdef __ASC_NPU_HOST__
-static_assert(BufferInfo<BufferType::L0C>::ConsPipe == PIPE_M);
-#else
+#ifdef TEST_HAS_FIX_PIPE
 static_assert(BufferInfo<BufferType::L0C>::ConsPipe == PIPE_FIX);
+#else
+static_assert(BufferInfo<BufferType::L0C>::ConsPipe == PIPE_M);
 #endif
 static_assert(BufferInfo<BufferType::L0C>::EventP2C == HardEvent::M_FIX);
 static_assert(BufferInfo<BufferType::L0C>::EventC2P == HardEvent::FIX_M);
@@ -159,9 +159,14 @@ static_assert(BufferInfo<BufferType::L0C>::EventC2P == HardEvent::FIX_M);
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "buffer_info.cpp"
             source.write_text(stub + declarations + assertions)
+            # The previous fixture incorrectly exposed FIX to every pass that
+            # lacked __ASC_NPU_HOST__, hiding other host/AIV parse failures.
             for defines in (
+                [],
                 ["-D__ASC_NPU_HOST__=1"],
-                ["-D__NPU_ARCH__=3510", "-D__DAV_C310_CUBE__=1"],
+                ["-D__NPU_HOST__=1"],
+                ["-D__ASCC_HOST__=1"],
+                ["-D__NPU_ARCH__=3510", "-D__DAV_C310_CUBE__=1", "-DTEST_HAS_FIX_PIPE=1"],
                 ["-D__NPU_ARCH__=3510", "-D__DAV_C310_VEC__=1"],
             ):
                 with self.subTest(defines=defines):

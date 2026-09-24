@@ -124,12 +124,14 @@ struct BufferInfo {
         } else if constexpr (Type == BufferType::L0B) {
             return PIPE_M;
         } else if constexpr (Type == BufferType::L0C) {
-#if defined(__ASC_NPU_HOST__)
-            // Native ASC parses constexpr bodies in the host pass, where
-            // PIPE_FIX is unavailable. This value is never used on device.
-            return PIPE_M;
-#else
+#if defined(__DAV_C310_CUBE__)
             return PIPE_FIX;
+#else
+            // Only the A5 Cube consumes L0C. Other native compilation passes
+            // still parse constexpr bodies and need not expose PIPE_FIX.
+            // Use the same positive Cube guard as the official mixed entry;
+            // host macro names differ across compiler versions.
+            return PIPE_M;
 #endif
         }
     }
